@@ -2343,7 +2343,10 @@ string Master::Http::QUOTA_HELP()
         "GET: Returns the currently set quotas as JSON.",
         "",
         "POST: Validates the request body as JSON",
-        " and sets quota for a role.",
+        " and sets quota for a role without a quota.",
+        "",
+        "PUT: Validates the request body as JSON",
+        " and updates existing quota for a role.",
         "",
         "DELETE: Validates the request body as JSON",
         " and removes quota for a role."),
@@ -2378,14 +2381,15 @@ Future<Response> Master::Http::quota(
     return quotaHandler.set(request, principal);
   }
 
+  if (request.method == "PUT") {
+    return quotaHandler.update(request, principal);
+  }
+
   if (request.method == "DELETE") {
     return quotaHandler.remove(request, principal);
   }
 
-  // TODO(joerg84): Add update logic for PUT requests
-  // once Quota supports updates.
-
-  return MethodNotAllowed({"GET", "POST", "DELETE"}, request.method);
+  return MethodNotAllowed({"GET", "POST", "PUT", "DELETE"}, request.method);
 }
 
 

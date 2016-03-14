@@ -1028,6 +1028,10 @@ private:
         const process::http::Request& request,
         const Option<std::string>& principal) const;
 
+    process::Future<process::http::Response> update(
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
+
   private:
     // Heuristically tries to determine whether a quota request could
     // reasonably be satisfied given the current cluster capacity. The
@@ -1089,6 +1093,10 @@ private:
         const Option<std::string>& principal,
         const mesos::quota::QuotaInfo& quotaInfo) const;
 
+    process::Future<bool> authorizeUpdateQuota(
+        const Option<std::string>& principal,
+        const mesos::quota::QuotaInfo& quotaInfo) const;
+
     process::Future<mesos::quota::QuotaStatus> _status(
         const Option<std::string>& principal) const;
 
@@ -1106,6 +1114,13 @@ private:
 
     process::Future<process::http::Response> __remove(
         const std::string& role) const;
+
+    process::Future<process::http::Response> _update(
+        const mesos::quota::QuotaRequest& quotaRequest,
+        const Option<std::string>& principal) const;
+
+    process::Future<Nothing> __update(
+        const Quota& quota) const;
 
     // To perform actions related to quota management, we require access to the
     // master data structures. No synchronization primitives are needed here

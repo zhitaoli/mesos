@@ -1178,6 +1178,35 @@ void HierarchicalAllocatorProcess::setQuota(
 }
 
 
+void HierarchicalAllocatorProcess::updateQuota(
+    const string& role,
+    const Quota& quota)
+{
+  CHECK(initialized);
+
+  // This method should be called by master only if the quota for
+  // the role is previous set.
+  CHECK(quotas.contains(role));
+  CHECK(quotaRoleSorter->contains(role));
+
+  Quota temp = quota;
+  quotas[role].info.Swap(&temp.info);
+
+  // Remove previously registered quota gauge callbacks before adding new.
+  metrics.removeQuota(role);
+  metrics.setQuota(role, quota);
+
+  // TODO(alexr): Print all quota info for the role.
+  LOG(INFO) << "Update quota from " << temp.info.guarantee()
+            << " to " << quota.info.guarantee()
+            << " for role '" << role << "'";
+
+  // Trigger the allocation explicitly in order to promptly react to the
+  // operator's request.
+  allocate();
+}
+
+
 void HierarchicalAllocatorProcess::removeQuota(
     const string& role)
 {

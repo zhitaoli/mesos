@@ -196,6 +196,10 @@ public:
   void removeQuota(
       const std::string& role);
 
+  void updateQuota(
+      const std::string& role,
+      const Quota& quota);
+
   void updateWeights(
       const std::vector<WeightInfo>& weightInfos);
 

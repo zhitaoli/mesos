@@ -17,6 +17,7 @@
 #include "master/master.hpp"
 
 #include <list>
+#include <set>
 #include <vector>
 
 #include <mesos/resources.hpp>
@@ -72,17 +73,16 @@ Option<Error> Master::QuotaHandler::capacityHeuristic(
 
   // This should have been validated earlier.
   CHECK(master->isWhitelistedRole(request.role()));
-  CHECK(!master->quotas.contains(request.role()));
 
   // Calculate the total amount of resources requested by all quotas
   // (including the request) in the cluster.
-  // NOTE: We have validated earlier that the quota for the role in the
-  // request does not exist, hence `master->quotas` is guaranteed not to
-  // contain the request role's quota yet.
-  // TODO(alexr): Relax this constraint once we allow updating quotas.
+  // If some existing quota has a matching role with the request,
+  // this is a quota update and we only count new request's guarantee.
   Resources totalQuota = request.guarantee();
-  foreachvalue (const Quota& quota, master->quotas) {
-    totalQuota += quota.info.guarantee();
+  foreachpair (const string& role, const Quota& quota, master->quotas) {
+    if (role != request.role()) {
+      totalQuota += quota.info.guarantee();
+    }
   }
 
   // Determine whether the total quota, including the new request, does
@@ -130,12 +130,12 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
   // This should have been validated earlier.
   CHECK(master->isWhitelistedRole(role));
 
-  int frameworksInRole = 0;
+  std::set<FrameworkID> frameworksInRole;
   if (master->activeRoles.contains(role)) {
     Role* roleState = master->activeRoles[role];
     foreachvalue (const Framework* framework, roleState->frameworks) {
       if (framework->connected && framework->active) {
-        ++frameworksInRole;
+        frameworksInRole.insert(framework->id());
       }
     }
   }
@@ -143,7 +143,7 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
   // The resources recovered by rescinding outstanding offers.
   Resources rescinded;
 
-  int visitedAgents = 0;
+  size_t visitedAgents = 0;
 
   // Because resources are allocated in the allocator, there can be a race
   // between rescinding and allocating. This race makes it hard to determine
@@ -173,7 +173,7 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
     // If we have rescinded offers with at least as many resources as the
     // quota request resources, then we are done.
     if (rescinded.contains(request.guarantee()) &&
-        (visitedAgents >= frameworksInRole)) {
+        (visitedAgents >= frameworksInRole.size())) {
       break;
     }
 
@@ -190,6 +190,11 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
     // Rescind all outstanding offers from the given agent.
     bool agentVisited = false;
     foreach (Offer* offer, utils::copy(slave->offers)) {
+      // Skip any offer already for frameworks in the quota'ed role,
+      if (frameworksInRole.count(offer->framework_id()) > 0) {
+        continue;
+      }
+
       master->allocator->recoverResources(
           offer->framework_id(), offer->slave_id(), offer->resources(), None());
 
@@ -359,7 +364,6 @@ Future<http::Response> Master::QuotaHandler::_set(
   }
 
   // Check that we are not updating an existing quota.
-  // TODO(joerg84): Update error message once quota update is in place.
   if (master->quotas.contains(quotaInfo.role())) {
     return BadRequest(
         "Failed to validate set quota request: Cannot set quota"
@@ -524,6 +528,142 @@ Future<http::Response> Master::QuotaHandler::__remove(const string& role) const
 }
 
 
+Future<http::Response> Master::QuotaHandler::update(
+    const http::Request& request,
+    const Option<string>& principal) const
+{
+  VLOG(1) << "Updating quota from request: '" << request.body << "'";
+
+  // Check that the request type is PUT which is guaranteed by the master.
+  CHECK_EQ("PUT", request.method);
+
+  // Parse the request body into JSON.
+  Try<JSON::Object> jsonRequest = JSON::parse<JSON::Object>(request.body);
+  if (jsonRequest.isError()) {
+    return BadRequest(
+        "Failed to parse update quota request JSON '" + request.body + "': " +
+        jsonRequest.error());
+  }
+
+  // Convert JSON request to the `QuotaRequest` protobuf.
+  Try<QuotaRequest> protoRequest =
+    ::protobuf::parse<QuotaRequest>(jsonRequest.get());
+
+  if (protoRequest.isError()) {
+    return BadRequest(
+        "Failed to validate update quota request JSON '" + request.body +
+        "': " + protoRequest.error());
+  }
+
+  return _update(protoRequest.get(), principal);
+}
+
+
+Future<http::Response> Master::QuotaHandler::_update(
+    const QuotaRequest& quotaRequest,
+    const Option<string>& principal) const
+{
+  Try<QuotaInfo> create = quota::createQuotaInfo(quotaRequest);
+  if (create.isError()) {
+    return BadRequest(
+        "Failed to create 'QuotaInfo' from update quota request: " +
+        create.error());
+  }
+
+  QuotaInfo quotaInfo = create.get();
+
+  // Check that the `QuotaInfo` is a valid quota request.
+  Option<Error> validateError = quota::validation::quotaInfo(quotaInfo);
+  if (validateError.isSome()) {
+    return BadRequest(
+        "Failed to validate update quota request: " +
+        validateError.get().message);
+  }
+
+  // Check that we are updating an existing quota.
+  Option<Quota> existing = master->quotas.get(quotaInfo.role());
+  if (existing.isNone()) {
+    return BadRequest(
+        "Failed to validate update quota request: Can not update quota"
+        " for role '" + quotaInfo.role() + "' which has no previous quota");
+  }
+
+
+  // The force flag is used to overwrite the `capacityHeuristic` check.
+  const bool forced = quotaRequest.force();
+
+  if (principal.isSome()) {
+    quotaInfo.set_principal(principal.get());
+  }
+
+  return authorizeSetQuota(principal, quotaInfo)
+    .then(defer(master->self(), [=](bool authorized) -> Future<http::Response> {
+      if (!authorized) {
+        return Forbidden();
+      }
+
+      Quota quota = Quota{quotaInfo};
+
+      // If new quota info is no more than existing quota info, we can skip
+      // the `capacityHeuristic` check and resource rescinding.
+      Resources delta = quotaInfo.guarantee() - existing.get().info.guarantee();
+      if (Resources::parse("").get().contains(delta)) {
+        return __update(quota)
+          .then(defer(master->self(), [=]() -> Future<http::Response> {
+            return OK();
+          }));
+      }
+
+      if (forced) {
+        VLOG(1)
+          << "Using force flag to override quota capacity heuristic check";
+      } else {
+        // Validate whether a quota request can be satisfied.
+        Option<Error> error = capacityHeuristic(quotaInfo);
+        if (error.isSome()) {
+          return Conflict(
+              "Heuristic capacity check for set quota request failed: " +
+              error.get().message);
+        }
+      }
+
+      return __update(quota)
+        .then(defer(master->self(), [=]() -> Future<http::Response> {
+          // We only need rescind resources to satisfy the delta.
+          QuotaInfo deltaInfo;
+          deltaInfo.set_role(quotaInfo.role());
+          deltaInfo.mutable_guarantee()->CopyFrom(delta);
+          rescindOffers(deltaInfo);
+          return OK();
+        }));
+    }));
+}
+
+
+Future<Nothing> Master::QuotaHandler::__update(
+    const Quota& quota) const
+{
+  // Populate master's quota-related local state. We do this before updating
+  // the registry in order to make sure that we are not already trying to
+  // satisfy a request for this role (since this is a multi-phase event).
+  // NOTE: We do not need to remove quota for the role if the registry update
+  // fails because in this case the master fails as well.
+  master->quotas[quota.info.role()] = quota;
+
+  // Update the registry with the new quota and acknowledge the request.
+  return master->registrar
+    ->apply(Owned<Operation>(new quota::UpdateQuota(quota.info)))
+    .then(defer(master->self(), [=](bool result) -> Future<Nothing> {
+      // See the top comment in "master/quota.hpp" for why this check is here.
+      CHECK(result);
+
+      master->allocator->updateQuota(quota.info.role(), quota);
+
+      return Nothing();
+    }));
+}
+
+
 Future<bool> Master::QuotaHandler::authorizeGetQuota(
     const Option<string>& principal,
     const QuotaInfo& quotaInfo) const
@@ -602,6 +742,31 @@ Future<bool> Master::QuotaHandler::authorizeRemoveQuota(
   }
 
   request.mutable_object()->set_value("RemoveQuota");
+  request.mutable_object()->mutable_quota_info()->CopyFrom(quotaInfo);
+
+  return master->authorizer.get()->authorized(request);
+}
+
+
+Future<bool> Master::QuotaHandler::authorizeUpdateQuota(
+    const Option<string>& principal,
+    const QuotaInfo& quotaInfo) const
+{
+  if (master->authorizer.isNone()) {
+    return true;
+  }
+
+  LOG(INFO) << "Authorizing principal '"
+            << (principal.isSome() ? principal.get() : "ANY")
+            << "' to update quota for role '" << quotaInfo.role() << "'";
+
+  authorization::Request request;
+  request.set_action(authorization::UPDATE_QUOTA);
+
+  if (principal.isSome()) {
+    request.mutable_subject()->set_value(principal.get());
+  }
+
   request.mutable_object()->mutable_quota_info()->CopyFrom(quotaInfo);
 
   return master->authorizer.get()->authorized(request);
