@@ -1300,40 +1300,42 @@ void HierarchicalAllocatorProcess::setQuota(
 {
   CHECK(initialized);
 
-  // This method should be called by the master only if the quota for
-  // the role is not set. Setting quota differs from updating it because
-  // the former moves the role to a different allocation group with a
-  // dedicated sorter, while the later just updates the actual quota.
-  CHECK(!quotas.contains(role));
+  Option<Quota> previous = quotas.get(role);
 
   // Persist quota in memory and add the role into the corresponding
   // allocation group.
   quotas[role] = quota;
-  quotaRoleSorter->add(role);
-  quotaRoleSorter->activate(role);
 
-  // Copy allocation information for the quota'ed role.
-  if (roleSorter->contains(role)) {
-    hashmap<SlaveID, Resources> roleAllocation = roleSorter->allocation(role);
-    foreachpair (
-        const SlaveID& slaveId, const Resources& resources, roleAllocation) {
-      // See comment at `quotaRoleSorter` declaration regarding non-revocable.
-      quotaRoleSorter->allocated(role, slaveId, resources.nonRevocable());
+  if (!previous.isSome()) {
+    quotaRoleSorter->add(role);
+    quotaRoleSorter->activate(role);
+
+    // Copy allocation information for the quota'ed role.
+    if (roleSorter->contains(role)) {
+      hashmap<SlaveID, Resources> roleAllocation = roleSorter->allocation(role);
+      foreachpair (
+          const SlaveID& slaveId, const Resources& resources, roleAllocation) {
+        // See comment at `quotaRoleSorter` declaration regarding non-revocable.
+        quotaRoleSorter->allocated(role, slaveId, resources.nonRevocable());
+      }
     }
+
+    // TODO(alexr): Print all quota info for the role.
+    LOG(INFO) << "Set quota " << quota.info.guarantee() << " for role '" << role
+              << "'";
+  } else {
+    metrics.removeQuota(role);
+
+    LOG(INFO) << "Update quota from " << previous->info.guarantee()
+              << " to " << quota.info.guarantee()
+              << " for role '" << role << "'";
   }
 
   metrics.setQuota(role, quota);
 
-  // TODO(alexr): Print all quota info for the role.
-  LOG(INFO) << "Set quota " << quota.info.guarantee() << " for role '" << role
-            << "'";
-
-  // NOTE: Since quota changes do not result in rebalancing of
-  // offered resources, we do not trigger an allocation here; the
-  // quota change will be reflected in subsequent allocations.
-  //
-  // If we add the ability for quota changes to incur a rebalancing
-  // of offered resources, then we should trigger that here.
+  // Trigger the allocation explicitly in order to promptly react to the
+  // operator's request.
+  allocate();
 }
 
 

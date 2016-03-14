@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <list>
+#include <set>
 #include <vector>
 
 #include <mesos/resources.hpp>
@@ -193,7 +194,6 @@ Option<Error> Master::QuotaHandler::capacityHeuristic(
 
   // This should have been validated earlier.
   CHECK(master->isWhitelistedRole(request.role()));
-  CHECK(!master->quotas.contains(request.role()));
 
   hashmap<string, Quota> quotaMap = master->quotas;
 
@@ -246,19 +246,19 @@ Option<Error> Master::QuotaHandler::capacityHeuristic(
 }
 
 
-void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
+void Master::QuotaHandler::rescindOffers(
+    const string& role,
+    const Resources& necessary) const
 {
-  const string& role = request.role();
-
   // This should have been validated earlier.
   CHECK(master->isWhitelistedRole(role));
 
-  int frameworksInRole = 0;
+  std::set<FrameworkID> frameworksInRole;
   if (master->roles.contains(role)) {
     Role* roleState = master->roles.at(role);
     foreachvalue (const Framework* framework, roleState->frameworks) {
       if (framework->active()) {
-        ++frameworksInRole;
+        frameworksInRole.insert(framework->id());
       }
     }
   }
@@ -266,7 +266,7 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
   // The resources recovered by rescinding outstanding offers.
   Resources rescinded;
 
-  int visitedAgents = 0;
+  size_t visitedAgents = 0;
 
   // Because resources are allocated in the allocator, there can be a race
   // between rescinding and allocating. This race makes it hard to determine
@@ -280,23 +280,23 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
   // coarse-grained nature of agent offers, and helps reduce fragmentation of
   // offers.
   //
-  // Consider a quota request for role `role` for `requested` resources.
+  // Consider a quota request for role `role` for `necessary` resources.
   // There are `numFiR` frameworks in `role`. Let `rescinded` be the total
   // number of rescinded resources and `numVA` be the number of visited
   // agents, from which at least one offer has been rescinded. Then the
   // algorithm can be summarized as follows:
   //
   //   while (there are agents with outstanding offers) do:
-  //     if ((`rescinded` contains `requested`) && (`numVA` >= `numFiR`) break;
+  //     if ((`rescinded` contains `necessary`) && (`numVA` >= `numFiR`) break;
   //     fetch an agent `a` with outstanding offers;
   //     rescind all outstanding offers from `a`;
   //     update `rescinded`, inc(numVA);
   //   end.
   foreachvalue (const Slave* slave, master->slaves.registered) {
-    // If we have rescinded offers with at least as many resources as the
-    // quota request resources, then we are done.
-    if (rescinded.contains(request.guarantee()) &&
-        (visitedAgents >= frameworksInRole)) {
+    // If we have rescinded offers with at least as many resources as
+    // necessary, then we are done.
+    if (rescinded.contains(necessary) &&
+        (visitedAgents >= frameworksInRole.size())) {
       break;
     }
 
@@ -313,6 +313,11 @@ void Master::QuotaHandler::rescindOffers(const QuotaInfo& request) const
     // Rescind all outstanding offers from the given agent.
     bool agentVisited = false;
     foreach (Offer* offer, utils::copy(slave->offers)) {
+      // Skip any offer already for frameworks in the quota'ed role,
+      if (frameworksInRole.count(offer->framework_id()) > 0) {
+        continue;
+      }
+
       master->allocator->recoverResources(
           offer->framework_id(), offer->slave_id(), offer->resources(), None());
 
@@ -499,15 +504,8 @@ Future<http::Response> Master::QuotaHandler::_set(
         quotaInfo.role() + "'");
   }
 
-  // Check that we are not updating an existing quota.
-  // TODO(joerg84): Update error message once quota update is in place.
-  if (master->quotas.contains(quotaInfo.role())) {
-    return BadRequest(
-        "Failed to validate set quota request: Cannot set quota"
-        " for role '" + quotaInfo.role() + "' which already has quota");
-  }
-
   hashmap<string, Quota> quotaMap = master->quotas;
+  Option<Quota> previous = quotaMap.get(quotaInfo.role());
 
   // Validate that adding this quota does not violate the hierarchical
   // relationship between quotas.
@@ -546,13 +544,14 @@ Future<http::Response> Master::QuotaHandler::_set(
 
   return authorizeUpdateQuota(principal, quotaInfo)
     .then(defer(master->self(), [=](bool authorized) -> Future<http::Response> {
-      return !authorized ? Forbidden() : __set(quotaInfo, forced);
+      return !authorized ? Forbidden() : __set(quotaInfo, previous, forced);
     }));
 }
 
 
 Future<http::Response> Master::QuotaHandler::__set(
     const QuotaInfo& quotaInfo,
+    const Option<Quota>& previous,
     bool forced) const
 {
   if (forced) {
@@ -586,6 +585,7 @@ Future<http::Response> Master::QuotaHandler::__set(
       master->allocator->setQuota(quotaInfo.role(), quota);
 
       // Rescind outstanding offers to facilitate satisfying the quota request.
+      // This is only necessary if it's a some resource(s) 
       // NOTE: We set quota before we rescind to avoid a race. If we were to
       // rescind first, then recovered resources may get allocated again
       // before our call to `setQuota` was handled.
@@ -595,7 +595,19 @@ Future<http::Response> Master::QuotaHandler::__set(
       // allocation is invoked.
       // This can be resolved in the future with an explicit allocation call,
       // and this solution is preferred to having the race described earlier.
-      rescindOffers(quotaInfo);
+      Option<Resources> necessary;
+      if (!previous.isSome()) {
+        necessary = quotaInfo.guarantee();
+      } else {
+        Resources delta = quotaInfo.guarantee() - previous->info.guarantee();
+        if (!Resources::parse("").get().contains(delta)) {
+          necessary = delta;
+        }
+      }
+
+      if (necessary.isSome()) {
+        rescindOffers(quotaInfo.role(), necessary.get());
+      }
 
       return OK();
     }));
@@ -752,6 +764,31 @@ Future<bool> Master::QuotaHandler::authorizeUpdateQuota(
   Option<authorization::Subject> subject = createSubject(principal);
   if (subject.isSome()) {
     request.mutable_subject()->CopyFrom(subject.get());
+  }
+
+  request.mutable_object()->mutable_quota_info()->CopyFrom(quotaInfo);
+
+  return master->authorizer.get()->authorized(request);
+}
+
+
+Future<bool> Master::QuotaHandler::authorizeUpdateQuota(
+    const Option<string>& principal,
+    const QuotaInfo& quotaInfo) const
+{
+  if (master->authorizer.isNone()) {
+    return true;
+  }
+
+  LOG(INFO) << "Authorizing principal '"
+            << (principal.isSome() ? principal.get() : "ANY")
+            << "' to update quota for role '" << quotaInfo.role() << "'";
+
+  authorization::Request request;
+  request.set_action(authorization::UPDATE_QUOTA);
+
+  if (principal.isSome()) {
+    request.mutable_subject()->set_value(principal.get());
   }
 
   request.mutable_object()->mutable_quota_info()->CopyFrom(quotaInfo);

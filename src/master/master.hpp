@@ -1083,7 +1083,9 @@ private:
     //
     // TODO(alexr): Consider removing this function once offer management
     // (including rescinding) is moved to allocator.
-    void rescindOffers(const mesos::quota::QuotaInfo& request) const;
+    void rescindOffers(
+        const std::string& role,
+        const Resources& necessary) const;
 
     process::Future<bool> authorizeGetQuota(
         const Option<process::http::authentication::Principal>& principal,
@@ -1091,6 +1093,10 @@ private:
 
     process::Future<bool> authorizeUpdateQuota(
         const Option<process::http::authentication::Principal>& principal,
+        const mesos::quota::QuotaInfo& quotaInfo) const;
+
+    process::Future<bool> authorizeUpdateQuota(
+        const Option<std::string>& principal,
         const mesos::quota::QuotaInfo& quotaInfo) const;
 
     process::Future<mesos::quota::QuotaStatus> _status(
@@ -1104,6 +1110,7 @@ private:
 
     process::Future<process::http::Response> __set(
         const mesos::quota::QuotaInfo& quotaInfo,
+        const Option<Quota>& previous,
         bool forced) const;
 
     process::Future<process::http::Response> _remove(
