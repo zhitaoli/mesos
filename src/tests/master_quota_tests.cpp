@@ -150,13 +150,6 @@ protected:
 // convertible to corresponding protobufs, all necessary fields are present,
 // while irrelevant fields are not present.
 
-// TODO(alexr): Tests to implement:
-//   * Implicit roles are used in the master.
-//   * Role is absent.
-//   * Role is an empty string.
-//   * Role is '*'?
-//   * Resources with the same name are present.
-
 // Verifies that a request for a non-existent role is rejected when
 // using an explicitly configured list of role names.
 TEST_F(MasterQuotaTest, SetForNonExistentRole)
@@ -178,6 +171,62 @@ TEST_F(MasterQuotaTest, SetForNonExistentRole)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
+}
+
+
+// Verifies that various set requests for incorrect role usage are
+// rejected.
+TEST_F(MasterQuotaTest, SetIncorrectRole)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // We do not need an agent since a request should be rejected before we
+  // start looking at available resources.
+
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+  // Send a quota request without role.
+  {
+    QuotaRequest request;
+    request.mutable_guarantee()->CopyFrom(
+        static_cast<const RepeatedPtrField<Resource>&>(quotaResources));
+
+    string requestBody = stringify(JSON::protobuf(request));
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        requestBody);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
+      << response.get().body;
+  }
+
+  // Send a quota request for wildcard role.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody("*", quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
+      << response.get().body;
+  }
+
+  // Send a quota request with empty string role name.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody("", quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
+      << response.get().body;
+  }
 }
 
 
@@ -306,6 +355,19 @@ TEST_F(MasterQuotaTest, SetRequestWithInvalidData)
       << response.get().body;
   }
 
+  // A quota set request with a resource name repeated more than once
+  // should return '400 Bad Request'.
+  {
+    Resources quotaResources =
+      Resources::parse("cpus:1;mem:512;cpus:1", ROLE1).get();
+
+    Future<Response> response = postQuota(ROLE1, quotaResources);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
+      << response.get().body;
+  }
+
+
   // A quota set request with the `DiskInfo` field set should return
   // '400 Bad Request'.
   {
@@ -355,9 +417,35 @@ TEST_F(MasterQuotaTest, SetRequestWithInvalidData)
 }
 
 
-// Updating an exiting quota via POST to the '/master/quota endpoint' should
-// return a '400 BadRequest'.
-TEST_F(MasterQuotaTest, SetExistingQuota)
+// Setting quota for master using implicit roles should succeed.
+TEST_F(MasterQuotaTest, SetQuotaWithImplicitRoleFlag)
+{
+  master::Flags flags = MesosTest::CreateMasterFlags();
+  flags.roles = None();
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  // Use the force flag for setting quota that cannot be satisfied in
+  // this empty cluster without any agents.
+  const bool FORCE = true;
+
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+  // Set quota for the role without quota set.
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody("non-existent-role", quotaResources, FORCE));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+    << response.get().body;
+}
+
+
+// Updating an exiting quota on the '/master/quota endpoint'.
+TEST_F(MasterQuotaTest, UpdateExistingQuota)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
