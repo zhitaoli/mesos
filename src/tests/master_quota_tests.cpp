@@ -31,6 +31,7 @@
 #include <process/owned.hpp>
 #include <process/pid.hpp>
 
+#include <stout/format.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
@@ -155,11 +156,33 @@ protected:
 // convertible to corresponding protobufs, all necessary fields are present,
 // while irrelevant fields are not present.
 
-// TODO(alexr): Tests to implement:
-//   * Role is absent.
-//   * Role is an empty string.
-//   * Role is '*'?
-//   * Resources with the same name are present.
+
+// Setting quota for master using implicit roles should succeed.
+TEST_F(MasterQuotaTest, SetQuotaWithImplicitRoleFlag)
+{
+  master::Flags flags = MesosTest::CreateMasterFlags();
+  flags.roles = None();
+
+  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  ASSERT_SOME(master);
+
+  // Use the force flag for setting quota that cannot be satisfied in
+  // this empty cluster without any agents.
+  const bool FORCE = true;
+
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+  // Set quota for the role without quota set.
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody(UNKNOWN_ROLE, quotaResources, FORCE));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+    << response.get().body;
+}
+
 
 // Verifies that a request for a non-existent role is rejected when
 // using an explicitly configured list of role names.
@@ -189,7 +212,7 @@ TEST_F(MasterQuotaTest, SetForNonExistentRole)
 }
 
 
-// Quota requests with invalid structure should return '400 Bad Request'.
+// Quota requests with invalid structure should return a '400 Bad Request'.
 TEST_F(MasterQuotaTest, InvalidSetRequest)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -313,6 +336,36 @@ TEST_F(MasterQuotaTest, SetRequestWithInvalidData)
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
       << response->body;
   }
+
+  // A quota set request with a resource name repeated more than once
+  // should return '400 Bad Request'.
+  {
+    Resource cpusResource = Resources::parse("cpus", "1", "*").get();
+    cpusResource.clear_role();
+
+    // Manually construct a bad request because `Resources` class merges
+    // resources with same name so we cannot use it.
+    const string badRequest = strings::format(
+        "{\"role\": \"%s\", \"guarantee\":[%s, %s]}",
+        ROLE1,
+        stringify(JSON::protobuf(cpusResource)),
+        stringify(JSON::protobuf(cpusResource))).get();
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        badRequest);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
+
+    AWAIT_EXPECT_RESPONSE_BODY_EQ(
+        "Failed to validate set quota request: QuotaInfo may not contain same "
+        "resource name twice",
+        response)
+     << response.get().body;
+  }
+
 
   // A quota set request with the `DiskInfo` field set should return
   // '400 Bad Request'.

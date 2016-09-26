@@ -133,6 +133,7 @@ Option<Error> quotaInfo(const QuotaInfo& quotaInfo)
     return Error("QuotaInfo with empty 'guarantee'");
   }
 
+  hashset<string> names;
   foreach (const Resource& resource, quotaInfo.guarantee()) {
     // Check that `resource` does not contain fields that are
     // irrelevant for quota.
@@ -150,6 +151,13 @@ Option<Error> quotaInfo(const QuotaInfo& quotaInfo)
 
     if (resource.type() != Value::SCALAR) {
       return Error("QuotaInfo must not include non-scalar resources");
+    }
+
+    // Check that resource name cannot repeat twice.
+    if (names.contains(resource.name())) {
+      return Error("QuotaInfo may not contain same resource name twice");
+    } else {
+      names.insert(resource.name());
     }
   }
 
