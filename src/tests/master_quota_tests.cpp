@@ -40,6 +40,7 @@
 #include "slave/slave.hpp"
 
 #include "tests/allocator.hpp"
+#include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 
 using google::protobuf::RepeatedPtrField;
@@ -57,6 +58,7 @@ using process::Future;
 using process::Owned;
 using process::PID;
 
+using process::http::Accepted;
 using process::http::BadRequest;
 using process::http::Conflict;
 using process::http::Forbidden;
@@ -68,6 +70,7 @@ using std::string;
 using std::vector;
 
 using testing::_;
+using testing::AtMost;
 using testing::DoAll;
 using testing::Eq;
 
@@ -97,12 +100,12 @@ protected:
           "cpus:2;gpus:0;mem:1024;disk:1024;ports:[31000-32000]").get()));
   }
 
-  // Sets up the master flags with two roles and a short allocation interval.
+  // Sets up the master flags with three roles and a short allocation interval.
   virtual master::Flags CreateMasterFlags()
   {
     master::Flags flags = MesosTest::CreateMasterFlags();
     flags.allocation_interval = Milliseconds(50);
-    flags.roles = strings::join(",", ROLE1, ROLE2);
+    flags.roles = strings::join(",", ROLE1, ROLE2, ROLE3);
     return flags;
   }
 
@@ -140,6 +143,7 @@ protected:
 protected:
   const string ROLE1{"role1"};
   const string ROLE2{"role2"};
+  const string ROLE3{"role3"};
   const string UNKNOWN_ROLE{"unknown"};
 
   Resources defaultAgentResources;
@@ -637,20 +641,6 @@ TEST_F(MasterQuotaTest, Status)
 // status. A quota request may be well-formed, but obviously infeasible, e.g.
 // request for 100 CPUs in a cluster with just 11 CPUs.
 
-// TODO(alexr): Tests to implement:
-//   * Sufficient total resources, but insufficient free resources due to
-//     running tasks (multiple agents).
-//   * Sufficient total resources, but insufficient free resources due to
-//     dynamic reservations.
-//   * Sufficient with static but insufficient without (static reservations
-//     are not included).
-//   * Multiple quotas in the cluster, sufficient free resources for a new
-//     request.
-//   * Multiple quotas in the cluster, insufficient free resources for a new
-//     request.
-//   * Deactivated or disconnected agents are not considered during quota
-//     capability heuristics.
-
 // Checks that a quota request is not satisfied if there are not enough
 // resources on a single agent and the force flag is not set.
 TEST_F(MasterQuotaTest, InsufficientResourcesSingleAgent)
@@ -1088,6 +1078,508 @@ TEST_F(MasterQuotaTest, AvailableResourcesAfterRescinding)
 
   framework3.stop();
   framework3.join();
+}
+
+
+// Checks that a quota request is still satisfied even
+// if tasks from other roles use up the capacity, because
+// we do not count tasks on unreserved resources when
+// performing capacity check.
+TEST_F(MasterQuotaTest, AvailableResourcesWithTasks)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave1 =
+    StartSlave(detector.get(), &containerizer);
+
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Start a scheduler and a task.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(ROLE1);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+
+  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  Resources clusterResources =
+    defaultAgentResources.get("cpus") +
+    defaultAgentResources.get("mems");
+
+  // Submit a quota request same to current agent resources for role2,
+  // This should still be satisified because resource usage of the task
+  // is not included in the heuristic check.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE2, clusterResources, false));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Checks that a quota request is satisfied even if there are enough
+// resources on multiple agents, but some part is dynamically reserved
+// for other roles.
+TEST_F(MasterQuotaTest, InsufficientResourcesWithDynamicReservation)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<SlaveID> slaveId;
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<0>(&slaveId),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(slaveId);
+  AWAIT_READY(agent1TotalResources);
+
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Start another agent and wait until its resources are available.
+  Future<Resources> agent2TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent2TotalResources)));
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(agent2TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent2TotalResources.get());
+
+  // Send a dynamic reserve operation for all cpus on agent1 to role1.
+  Resources toReserve =
+    agent1TotalResources.get().filter([=](const Resource& resource) {
+      return (resource.name() == "cpus");
+  });
+
+  Resources dynamicallyReserved = toReserve.flatten(
+      ROLE1,
+      createReservationInfo(DEFAULT_CREDENTIAL.principal())).get();
+
+  const google::protobuf::RepeatedPtrField<Resource>& repeated =
+    dynamicallyReserved;
+
+  string reservationBody = strings::format(
+      "slaveId=%s&resources=%s",
+      slaveId->value(),
+      JSON::protobuf(repeated)).get();
+
+  Future<CheckpointResourcesMessage> checkpointResources =
+    FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, slave1.get()->pid);
+
+  Future<Response> reservationResponse = process::http::post(
+      master.get()->pid,
+      "reserve",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      reservationBody);
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Accepted().status, reservationResponse)
+    << reservationResponse.get().body;
+
+  // If checkpoint resources is received on slave1, then master
+  // have applied the reservation operation internally.
+  AWAIT_READY(checkpointResources);
+
+  // Our quota request requires total amount of cpus and mem in the cluster.
+  Resources quotaResources =
+    agent1TotalResources.get().filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    }) +
+    agent2TotalResources.get().filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+
+  EXPECT_TRUE((agent1TotalResources.get() + agent2TotalResources.get())
+    .contains(quotaResources));
+
+  // Dynamically reserved resources are still counted as available
+  // towards quota for now, so requesting can still be satisfied.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE2, quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+}
+
+
+// Checks that a quota request is not satisfied if there are enough
+// resources on multiple agents, but some part is statically reserved.
+TEST_F(MasterQuotaTest, InsufficientResourcesWithStaticReservation)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Start another agent whose cpus resource is statically reserved,
+  // and wait until its resources are available.
+  string slave2Resources =
+    "cpus(role1):1;mem:512;disk:1024;ports:[31000-32000]";
+  slave::Flags slave2Flags = CreateSlaveFlags();
+  slave2Flags.resources = slave2Resources;
+  Future<Resources> agent2TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent2TotalResources)));
+
+  Try<Owned<cluster::Slave>> slave2 =
+    StartSlave(detector.get(), slave2Flags);
+  ASSERT_SOME(slave2);
+
+  AWAIT_READY(agent2TotalResources);
+  EXPECT_EQ(Resources::parse(slave2Resources).get(),
+            agent2TotalResources.get());
+
+  // Our quota request requires more resources than available on the agent
+  // (and in the cluster).
+  Resources quotaResources =
+    agent1TotalResources.get().filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    }) +
+    Resources::parse("cpus:1;mem:512").get();
+
+  // Because statically reserved resources are not counted in heuristic
+  // check, quota request should fail.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Conflict().status, response)
+      << response.get().body;
+  }
+
+  // Force flag should override the `capacityHeuristic` check and make the
+  // request succeed.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources, true));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+}
+
+
+// Checks that a quota request can be created when there is still
+// enough resources after multiple existing quotas.
+TEST_F(MasterQuotaTest, SufficientResourcesMultipleQuotas)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  Resources role1Quota = Resources::parse("cpus:1").get();
+  Resources role2Quota = Resources::parse("mem:512").get();
+  Resources role3Quota = Resources::parse("cpus:1;mem:512").get();
+
+  EXPECT_TRUE(defaultAgentResources.contains(
+      role1Quota + role2Quota + role3Quota));
+
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, role1Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE2, role2Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE3, role3Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+}
+
+
+// Checks that disconnected slave is not counted in `capacityHeuristic`.
+TEST_F(MasterQuotaTest, InsufficientResourceAfterSlaveDisconnect)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Future<process::Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  Resources quotaResources =
+    defaultAgentResources.filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+
+  // Make sure deactivateSlave is called on allocator.
+  Future<SlaveID> deactivatedSlaveID;
+  EXPECT_CALL(allocator, deactivateSlave(_))
+    .WillOnce(DoAll(InvokeDeactivateSlave(&allocator),
+                    FutureArg<0>(&deactivatedSlaveID)));
+
+  // Inject a slave exited event at the master causing the master
+  // to mark the slave as disconnected.
+  process::inject::exited(slaveRegisteredMessage.get().to, master.get()->pid);
+
+  // Wait until allocator deactivates the slave.
+  AWAIT_READY(deactivatedSlaveID);
+
+  // There is no resource left after master deactivates the slave,
+  // so request should fail due to `capacityHeuristic` check.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Conflict().status, response)
+      << response.get().body;
+  }
+
+  // Force flag should override the `capacityHeuristic` check and make the
+  // request succeed.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources, true));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+}
+
+
+// Checks that a quota request cannot be satisfied without
+// enough resources after multiple existing quotas.
+TEST_F(MasterQuotaTest, InsufficientResourcesMultipleQuotas)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  Resources role1Quota = Resources::parse("cpus:1").get();
+  Resources role2Quota = Resources::parse("mem:512").get();
+  Resources role3Quota =
+    defaultAgentResources.filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+
+  EXPECT_TRUE(defaultAgentResources.contains(role1Quota + role2Quota));
+  EXPECT_FALSE(
+    defaultAgentResources.contains(role1Quota + role2Quota + role3Quota));
+
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, role1Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE2, role2Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // There is not enough resource for role3 quota request,
+  // so request should fail due to `capacityHeuristic` check.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE3, role3Quota));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Conflict().status, response)
+      << response.get().body;
+  }
+
+  // Force flag should override the `capacityHeuristic` check and make the
+  // request succeed.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE3, role3Quota, true));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
 }
 
 
