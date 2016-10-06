@@ -1029,6 +1029,10 @@ private:
         const Option<std::string>& principal) const;
 
     process::Future<process::http::Response> update(
+        const mesos::master::Call& call,
+        const Option<std::string>& principal) const;
+
+    process::Future<process::http::Response> update(
         const process::http::Request& request,
         const Option<std::string>& principal) const;
 

@@ -218,6 +218,12 @@ Option<Error> validate(
       }
       return None();
 
+    case mesos::master::Call::UPDATE_QUOTA:
+      if (!call.has_update_quota()) {
+        return Error("Expecting 'update_quota' to be present");
+      }
+      return None();
+
     case mesos::master::Call::SUBSCRIBE:
       return None();
   }

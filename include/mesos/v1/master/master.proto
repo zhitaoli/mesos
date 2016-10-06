@@ -85,6 +85,7 @@ message Call {
     GET_QUOTA = 28;
     SET_QUOTA = 29;          // See 'SetQuota' below.
     REMOVE_QUOTA = 30;
+    UPDATE_QUOTA = 31;       // See 'UpdateQuota below.'
   }
 
   // Provides a snapshot of the current metrics tracked by the master.
@@ -186,6 +187,11 @@ message Call {
     required string role = 1;
   }
 
+  // Update existing quota for the role specified in `quota_request`.
+  message UpdateQuota {
+    required quota.QuotaRequest quota_request = 1;
+  }
+
   optional Type type = 1;
 
   optional GetMetrics get_metrics = 2;
@@ -202,6 +208,7 @@ message Call {
   optional StopMaintenance stop_maintenance  = 13;
   optional SetQuota set_quota = 14;
   optional RemoveQuota remove_quota = 15;
+  optional UpdateQuota update_quota = 16;
 }
 
 

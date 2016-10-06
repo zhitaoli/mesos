@@ -529,6 +529,17 @@ Future<http::Response> Master::QuotaHandler::__remove(const string& role) const
 
 
 Future<http::Response> Master::QuotaHandler::update(
+    const mesos::master::Call& call,
+    const Option<string>& principal) const
+{
+  CHECK_EQ(mesos::master::Call::UPDATE_QUOTA, call.type());
+  CHECK(call.has_update_quota());
+
+  return _update(call.update_quota().quota_request(), principal);
+}
+
+
+Future<http::Response> Master::QuotaHandler::update(
     const http::Request& request,
     const Option<string>& principal) const
 {

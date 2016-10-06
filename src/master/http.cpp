@@ -595,6 +595,9 @@ Future<Response> Master::Http::api(
     case mesos::master::Call::REMOVE_QUOTA:
       return quotaHandler.remove(call, principal);
 
+    case mesos::master::Call::UPDATE_QUOTA:
+      return quotaHandler.update(call, principal);
+
     case mesos::master::Call::SUBSCRIBE:
       return subscribe(call, principal, acceptType);
   }
