@@ -82,12 +82,9 @@ to configure quotas. The endpoint currently offers a REST-like interface and
 supports the following operations:
 
 * [Setting](#setRequest) a new quota with POST.
+* [UPdating](#updateRequest) an existing quota with PUT.
 * [Removing](#removeRequest) an existing quota with DELETE.
 * [Querying](#statusRequest) the currently set quota with GET.
-
-Currently it is not possible to update previously configured quotas. This means
-in order to update a quota for a given role, the operator has to remove the
-existing quota and then set a new one.
 
 The endpoint can optionally use authentication and authorization. See the
 [authentication guide](authentication.md) for details.
@@ -144,6 +141,41 @@ The operator will receive one of the following HTTP response codes:
 * `403 Forbidden`: Unauthorized request.
 * `409 Conflict`: The capacity heuristic check failed due to insufficient
   resources.
+
+<a name="updateRequest"></a>
+## Update
+
+The operator can update an existing quota by sending an HTTP PUT request to the `/quota`
+endpoint.
+
+The syntax for update request is identitical to [set request](#setRequest).
+
+An example request to the quota endpoint could look like this (using the JSON
+file above in [set request](#setRequest)):
+
+    $ curl -d @quota.json -X PUT http://<master-ip>:<port>/quota
+
+An update request is only valid for roles with existing quota set.
+
+In order to bypass the [capacity heuristic](#capacityHeuristic) check the
+operator should set an optional `force` field:
+
+        {
+          "force": true,
+          "role": "role1",
+          ...
+        }
+
+The operator will receive one of the following HTTP response codes:
+
+* `200 OK`: Success (the update request was successful).
+* `400 BadRequest`: Invalid arguments (e.g., quota for role not exists,
+  invalid JSON, non-scalar resources included).
+* `401 Unauthorized`: Unauthenticated request.
+* `403 Forbidden`: Unauthorized request.
+* `409 Conflict`: The capacity heuristic check failed due to insufficient
+  resources.
+
 
 <a name="removeRequest"></a>
 ## Remove
@@ -209,7 +241,8 @@ __NOTE:__ If the principal is not authorized to query quota status for certain
 There are several stages in the lifetime of a quota issued by operator. First
 the [quota set request is handled by the master](#requestProcessing), after that
 the [allocator enforces the quota](#allocatorEnforcement).
-Quotas can be [removed](#removeProcessing) by the operator.
+Quotas can be [removed](#removeProcessing) or [updated](#updateProcessing)
+by the operator.
 
 It is important to understand that the enforcement of quota depends on
 the allocator being used. A custom allocator could choose to handle quota in its
@@ -246,6 +279,20 @@ The quota remove request processing is simpler and triggers the following steps:
 3. [Authorize](authentication.md) the HTTP request if authorization is enabled.
 4. Reliably remove quota.
 
+<a name="updateProcessing"></a>
+The quota update request processing is similar to set request processing and
+triggers the following steps:
+
+1. [Authenticate](authentication.md) the HTTP request.
+2. Parse and validate the request.
+   See [description of potential error codes](#updateRequest).
+3. [Authorize](authentication.md) the HTTP request if authorization is enabled.
+4. Run the [capacity heuristic](#capacityHeuristic) if not disabled by
+   [the `force` flag](#setRequest), and any quota'ed resource is increased in
+   the update request.
+5. Reliably store updated quota. See [details on failover recovery](#failover).
+6. [Rescind outstanding offers](#rescindOffers).
+
 <a name="capacityHeuristic"></a>
 ### Capacity Heuristic Check
 
@@ -274,14 +321,14 @@ resources will be added shortly.
 
 <a name="rescindOffers"></a>
 ### Rescinding Outstanding Offers
-
-When setting a new quota, the master rescinds outstanding offers. This avoids
+When setting a new quota or updating an existing quota to increase allocation
+of some scalar resource(s), the master rescinds outstanding offers. This avoids
 situations where the quota request cannot be satisfied by the remaining
 unoffered resources, but there are enough resources tied up in outstanding
 offers to frameworks that have not accepted them yet. Hence, we rescind
 outstanding offers with the following rules:
 
-* Rescind at least as many resources as there are in the quota request.
+* Rescind at least as many resources as needed in the quota request.
 * If at least one offer is to be rescinded from an agent, all offers from this
   agent are rescinded. This is done in order to make the potential offer bigger,
   which increases the chances that a quota'ed framework will be able to use the
@@ -335,11 +382,9 @@ suspension---ends when either:
 
 # Current Limitations
 
-* The quota set request does not allow specifying the granularity of the
+* The quota request does not allow specifying the granularity of the
   requested resources (e.g. 10 CPUs on a single node).
-* The quota set request does not allow to specify constraints (e.g. 2*5 cpus on
+* The quota request does not allow to specify constraints (e.g. 2*5 cpus on
   disjoint nodes for an HA like setup).
 * Quota is not allowed for the default role ‘*’ (see
   [MESOS-3938](https://issues.apache.org/jira/browse/MESOS-3938)).
-* Currently it is not possible to update previously configured quotas. See
-  [quota set request](#setRequest) for details.
