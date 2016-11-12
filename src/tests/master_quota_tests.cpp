@@ -24,6 +24,7 @@
 
 #include <mesos/quota/quota.hpp>
 
+#include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/http.hpp>
 #include <process/id.hpp>
@@ -54,6 +55,7 @@ using mesos::master::detector::MasterDetector;
 using mesos::quota::QuotaRequest;
 using mesos::quota::QuotaStatus;
 
+using process::Clock;
 using process::Future;
 using process::Owned;
 using process::PID;
@@ -1588,18 +1590,746 @@ TEST_F(MasterQuotaTest, InsufficientResourcesMultipleQuotas)
 // implement basic quota guarantees.
 
 // TODO(alexr): Tests to implement:
-//   * An agent with quota'ed tasks disconnects and there are not enough free
-//     resources (alert and under quota situation).
-//   * An agent with quota'ed tasks disconnects and there are enough free
-//     resources (new offers).
 //   * Role quota is below its allocation (InverseOffer generation).
-//   * Two roles, two frameworks, one is production but rejects offers, the
-//     other is greedy and tries to hijack the cluster which is prevented by
-//     quota.
-//   * Quota'ed and non-quota'ed roles, multiple frameworks in quota'ed role,
-//     ensure total allocation sums up to quota.
-//   * Remove quota with no running tasks.
-//   * Remove quota with running tasks.
+
+
+// Checks that an agent with quota'ed tasks disconnects and there are not enough
+// free resources (alert and under quota situation).
+TEST_F(MasterQuotaTest, InsufficientAfterSlaveWithQuotaTaskDisconnect)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  Future<process::Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 =
+    StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave1);
+
+  // Capture the slaveRegisteredMessage which includes the slave pid.
+  AWAIT_READY(slaveRegisteredMessage);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Submit a quota request for the given role.
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+  {
+    Future<Quota> receivedSetRequest;
+    EXPECT_CALL(allocator, setQuota(Eq(ROLE1), _))
+      .WillOnce(DoAll(InvokeSetQuota(&allocator),
+                      FutureArg<1>(&receivedSetRequest)));
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources, /*force*/false));
+
+    // Quota request succeeds and reaches the allocator.
+    AWAIT_READY(receivedSetRequest);
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // Start a scheduler and a task.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(ROLE1);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  Offer offer = offers.get()[0];
+  Resources taskResources = quotaResources;
+  ASSERT_TRUE(Resources(offer.resources()).contains(taskResources));
+
+  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  // Expect a TASK_RUNNING status, then a TASK_LOST after slave disconnect.
+  Future<TaskStatus> runningStatus;
+  Future<TaskStatus> lostStatus;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&runningStatus))
+    .WillOnce(FutureArg<1>(&lostStatus));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(runningStatus);
+  EXPECT_EQ(TASK_RUNNING, runningStatus.get().state());
+
+  // Make sure deactivateSlave is called on allocator.
+  Future<SlaveID> deactivatedSlaveID;
+  EXPECT_CALL(allocator, deactivateSlave(_))
+    .WillOnce(DoAll(InvokeDeactivateSlave(&allocator),
+                    FutureArg<0>(&deactivatedSlaveID)));
+
+  // Inject a slave exited event at the master causing the master
+  // to mark the slave as disconnected.
+  process::inject::exited(slaveRegisteredMessage.get().to, master.get()->pid);
+
+  // Wait until allocator deactivates the slave.
+  AWAIT_READY(deactivatedSlaveID);
+
+  AWAIT_READY(lostStatus);
+  EXPECT_EQ(TASK_LOST, lostStatus.get().state());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Checks that an agent with quota'ed tasks disconnects and there are still
+// enough free resources from another agent.
+TEST_F(MasterQuotaTest, SufficientAfterSlaveWithQuotaTaskDisconnect)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+  Future<process::Message> slaveRegisteredMessage =
+    FUTURE_MESSAGE(Eq(SlaveRegisteredMessage().GetTypeName()), _, _);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 =
+    StartSlave(detector.get(), &containerizer);
+
+  ASSERT_SOME(slave1);
+
+  // Capture the slaveRegisteredMessage which includes the slave pid.
+  AWAIT_READY(slaveRegisteredMessage);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Submit a quota request for the given role.
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+  {
+    Future<Quota> receivedSetRequest;
+    EXPECT_CALL(allocator, setQuota(Eq(ROLE1), _))
+      .WillOnce(DoAll(InvokeSetQuota(&allocator),
+                      FutureArg<1>(&receivedSetRequest)));
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources, /*force*/false));
+
+    // Quota request succeeds and reaches the allocator.
+    AWAIT_READY(receivedSetRequest);
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // Start a scheduler and a task.
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_role(ROLE1);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_EQ(1u, offers.get().size());
+
+  Offer offer = offers.get()[0];
+  Resources taskResources = quotaResources;
+  ASSERT_TRUE(Resources(offer.resources()).contains(taskResources));
+
+  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  // Expect a TASK_RUNNING status, then a TASK_LOST after slave disconnect.
+  Future<TaskStatus> runningStatus;
+  Future<TaskStatus> lostStatus;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&runningStatus))
+    .WillOnce(FutureArg<1>(&lostStatus));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(runningStatus);
+  EXPECT_EQ(TASK_RUNNING, runningStatus.get().state());
+
+  // Start another agent and wait until its resources are available.
+  Future<Resources> agent2TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent2TotalResources)));
+
+  // Capture slave2 id.
+  Future<SlaveRegisteredMessage> slave2RegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
+  ASSERT_SOME(slave2);
+  AWAIT_READY(slave2RegisteredMessage);
+  AWAIT_READY(agent2TotalResources);
+
+  // NOTE: we probably should forcefully trigger an allocation and make sure
+  // no additional offer is sent to scheduler, because quota is already
+  // satisfied.
+
+  // Make sure deactivateSlave is called on allocator.
+  Future<SlaveID> deactivatedSlaveID;
+  EXPECT_CALL(allocator, deactivateSlave(_))
+    .WillOnce(
+      DoAll(
+        InvokeDeactivateSlave(&allocator), FutureArg<0>(&deactivatedSlaveID)))
+    .WillOnce(Return());  // Skip second deactivateSlave.
+
+  // Inject a slave exited event at the master causing the master
+  // to mark the slave as disconnected.
+  process::inject::exited(slaveRegisteredMessage.get().to, master.get()->pid);
+
+  // Wait until allocator deactivates the slave.
+  AWAIT_READY(deactivatedSlaveID);
+
+  AWAIT_READY(lostStatus);
+  EXPECT_EQ(TASK_LOST, lostStatus.get().state());
+
+  // Expect an offer to be sent for slave2.
+  Future<vector<Offer>> offers2;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers2))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  AWAIT_READY(offers2);
+  EXPECT_EQ(1u, offers2.get().size());
+  EXPECT_EQ(slave2RegisteredMessage.get().slave_id(),
+            offers2.get()[0].slave_id());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Checks: two roles, two frameworks, one is production but rejects offers, the
+// other is greedy and tries to hijack the cluster which is prevented by quota.
+TEST_F(MasterQuotaTest, GreedyFrameworkCannotHijackQuotaRole)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  master::Flags flags = MesosTest::CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator, flags);
+  ASSERT_SOME(master);
+
+  // We request quota for all cpus and mem for the agent.
+  Resources quotaResources =
+    defaultAgentResources.filter(
+        [=](const Resource& resource) {
+          return (resource.name() == "cpus" || resource.name() == "mem");
+        });
+
+  const bool force = true;
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody(ROLE1, quotaResources, force));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response) << response.get().body;
+
+  // We create a "filtering" framework which declines every offer
+  // it sees.
+  FrameworkInfo frameworkInfo1 = createFrameworkInfo(ROLE1);
+  MockScheduler sched1;
+  MesosSchedulerDriver framework1(
+      &sched1, frameworkInfo1, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  // Launch `framework1` in quota'ed role.
+  Future<Nothing> registered1;
+  EXPECT_CALL(sched1, registered(&framework1, _, _))
+    .WillOnce(FutureSatisfy(&registered1));
+
+  framework1.start();
+  AWAIT_READY(registered1);
+
+  // Launch framework2 in a different role.
+  FrameworkInfo frameworkInfo2 = createFrameworkInfo(ROLE2);
+  MockScheduler sched2;
+  MesosSchedulerDriver framework2(
+      &sched2, frameworkInfo2, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered2;
+  EXPECT_CALL(sched2, registered(&framework2, _, _))
+    .WillOnce(FutureSatisfy(&registered2));
+
+  framework2.start();
+  AWAIT_READY(registered2);
+
+  // Start one agent and wait until its resources are available.
+  Future<Resources> agent1TotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agent1TotalResources)));
+
+  // The resource should be offered to framework1, then being declined.
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched1, resourceOffers(&framework1, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  AWAIT_READY(agent1TotalResources);
+  EXPECT_EQ(defaultAgentResources, agent1TotalResources.get());
+
+  // Confirm that offer is sent at least once.
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers.get().size());
+
+  // Make sure allocator recovers the resource from decline.
+  Future<Resources> declinedResources;
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+    .WillOnce(DoAll(InvokeRecoverResources(&allocator),
+                    FutureArg<2>(&declinedResources)));
+
+  // Now `framework` declines the offer and sets a filter
+  // with the duration greater than the allocation interval.
+  Duration filterTimeout = flags.allocation_interval * 2;
+  Filters offerFilter;
+  offerFilter.set_refuse_seconds(filterTimeout.secs());
+
+  framework1.declineOffer(offers.get()[0].id(), offerFilter);
+
+  AWAIT_READY(declinedResources);
+
+  Clock::pause();
+
+  // Ensure the offer filter timeout is set before advancing the clock.
+  Clock::settle();
+
+  // Resources on the agent should never be offered to framework2.
+  EXPECT_CALL(sched2, resourceOffers(&framework2, _))
+    .Times(0);
+
+  // Trigger a batch allocation.
+  Clock::advance(flags.allocation_interval);
+  Clock::settle();
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched1, resourceOffers(&framework1, _))
+    .WillOnce(FutureArg<1>(&offers2));
+  EXPECT_CALL(allocator, recoverResources(_, _, _, _))
+    .WillOnce(Return());
+
+  // Trigger another batch allocation: filter timeout and we should
+  // see another offer to `framework1`.
+  Clock::advance(flags.allocation_interval);
+  Clock::settle();
+
+  AWAIT_READY(offers2);
+
+  framework1.stop();
+  framework1.join();
+
+  framework2.stop();
+  framework2.join();
+
+  Clock::resume();
+}
+
+
+// Checks: multiple frameworks in quota'ed role and one framework in non
+// quota'ed role, ensure total allocation satisfies quota, but may slightly
+// exceed quota due to coarse-grained allocation.
+TEST_F(MasterQuotaTest, TotalAllocationSatisfiesQuota)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Create three frameworks, put the first two in ROLE1, and the last in ROLE2.
+  FrameworkInfo frameworkInfo1 = createFrameworkInfo(ROLE1);
+  MockScheduler sched1;
+  MesosSchedulerDriver framework1(
+      &sched1, frameworkInfo1, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered1;
+  EXPECT_CALL(sched1, registered(&framework1, _, _))
+    .WillOnce(FutureSatisfy(&registered1));
+
+  framework1.start();
+  AWAIT_READY(registered1);
+
+  FrameworkInfo frameworkInfo2 = createFrameworkInfo(ROLE1);
+  MockScheduler sched2;
+  MesosSchedulerDriver framework2(
+      &sched2, frameworkInfo2, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered2;
+  EXPECT_CALL(sched2, registered(&framework2, _, _))
+    .WillOnce(FutureSatisfy(&registered2));
+
+  framework2.start();
+  AWAIT_READY(registered2);
+
+  FrameworkInfo frameworkInfo3 = createFrameworkInfo(ROLE2);
+  MockScheduler sched3;
+  MesosSchedulerDriver framework3(
+      &sched3, frameworkInfo3, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered3;
+  EXPECT_CALL(sched3, registered(&framework3, _, _))
+    .WillOnce(FutureSatisfy(&registered3));
+
+  framework3.start();
+  AWAIT_READY(registered3);
+
+  // Forcefully request quota for more than one slave but less than two slaves.
+  Resources agentResources =
+    defaultAgentResources.filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+  Resources deltaResources = Resources::parse("cpus:1;mem:512").get();
+  CHECK(agentResources.contains(deltaResources));
+  Resources quotaResources = agentResources + deltaResources;
+
+  const bool force = true;
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody(ROLE1, quotaResources, force));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response) << response.get().body;
+
+  // Setup offer expectation for all frameworks.
+  Future<vector<Offer>> offers1;
+  EXPECT_CALL(sched1, resourceOffers(&framework1, _))
+    .WillOnce(FutureArg<1>(&offers1));
+
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched2, resourceOffers(&framework2, _))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  Future<vector<Offer>> offers3;
+  EXPECT_CALL(sched3, resourceOffers(&framework3, _))
+    .WillOnce(FutureArg<1>(&offers3));
+
+  // Make sure all three slaves are addded.
+  Future<Resources> lastAgentResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .Times(3)
+    .WillOnce(InvokeAddSlave(&allocator))
+    .WillOnce(InvokeAddSlave(&allocator))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&lastAgentResources)));
+
+  // Start three slaves.
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
+  ASSERT_SOME(slave2);
+
+  Try<Owned<cluster::Slave>> slave3 = StartSlave(detector.get());
+  ASSERT_SOME(slave3);
+
+  AWAIT_READY(lastAgentResources);
+
+  AWAIT_READY(offers1);
+  EXPECT_EQ(1u, offers1.get().size());
+
+  AWAIT_READY(offers2);
+  EXPECT_EQ(1u, offers2.get().size());
+
+  Resources role1Resources =
+    (offers1.get()[0].resources() + offers2.get()[0].resources())
+    .filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+
+  // Because default allocator does not perform fine-grained allocation,
+  // but instead allocate full agent, the total resources could exceed
+  // quotaResources.
+  EXPECT_EQ(agentResources + agentResources, role1Resources);
+  EXPECT_TRUE(role1Resources.contains(quotaResources));
+
+  AWAIT_READY(offers3);
+  EXPECT_NE(0u, offers3.get().size());
+
+  framework1.stop();
+  framework1.join();
+
+  framework2.stop();
+  framework2.join();
+
+  framework3.stop();
+  framework3.join();
+}
+
+
+// Checks that removing existing quota when no task should not trigger
+// offer rescind.
+TEST_F(MasterQuotaTest, RemoveQuotaNoTask)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Make sure slave is registered.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  // Start a slave.
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Set a quota for role1.
+  {
+    Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // Start a framework in role1.
+  FrameworkInfo frameworkInfo = createFrameworkInfo(ROLE1);
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+  AWAIT_READY(registered);
+  AWAIT_READY(offers);
+
+  // Wrap the `http::requestDelete` into a lambda for readability of the test.
+  auto removeQuota = [this, &master](const string& path) {
+    return process::http::requestDelete(
+        master.get()->pid,
+        path,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+  };
+
+  // Make sure no offerRescinded on framework.
+  EXPECT_CALL(sched, offerRescinded(&driver, _))
+    .Times(0);
+
+  // Ensure we can remove the quota we have requested before.
+  {
+    Future<Nothing> receivedRemoveRequest;
+    EXPECT_CALL(allocator, removeQuota(Eq(ROLE1)))
+      .WillOnce(DoAll(InvokeRemoveQuota(&allocator),
+                      FutureSatisfy(&receivedRemoveRequest)));
+
+    Future<Response> response  = removeQuota("quota/" + ROLE1);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+
+    // Ensure that the quota remove request has reached the allocator.
+    AWAIT_READY(receivedRemoveRequest);
+  }
+
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Checks that removing existing quota when some task uses the resource
+// is fine.
+TEST_F(MasterQuotaTest, RemoveQuotaWithTask)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Make sure slave is registered.
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  // Start a slave.
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Set a quota for role1.
+  {
+    Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, quotaResources));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // Start a framework in role1.
+  FrameworkInfo frameworkInfo = createFrameworkInfo(ROLE1);
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+  AWAIT_READY(registered);
+  AWAIT_READY(offers);
+  EXPECT_EQ(1u, offers.get().size());
+
+  TaskInfo task = createTask(offers.get()[0], "", DEFAULT_EXECUTOR_ID);
+
+  EXPECT_CALL(exec, registered(_, _, _, _));
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Wrap the `http::requestDelete` into a lambda for readability of the test.
+  auto removeQuota = [this, &master](const string& path) {
+    return process::http::requestDelete(
+        master.get()->pid,
+        path,
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+  };
+
+  // Ensure we can remove the quota we have requested before.
+  {
+    Future<Nothing> receivedRemoveRequest;
+    EXPECT_CALL(allocator, removeQuota(Eq(ROLE1)))
+      .WillOnce(DoAll(InvokeRemoveQuota(&allocator),
+                      FutureSatisfy(&receivedRemoveRequest)));
+
+    Future<Response> response  = removeQuota("quota/" + ROLE1);
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+
+    // Ensure that the quota remove request has reached the allocator.
+    AWAIT_READY(receivedRemoveRequest);
+  }
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
 
 
 // These tests verify the behavior in presence of master failover and recovery.
