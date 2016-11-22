@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -2403,6 +2404,195 @@ TEST_F(MasterQuotaTest, RemoveQuotaWithTask)
 
   driver.stop();
   driver.join();
+}
+
+
+// Checks that an update quota which increases the quota of role
+// triggers proper offer rescind from competing roles until new
+// quota is satisfied, while decreasing quota does not trigger
+// rescind in current implementation.
+TEST_F(MasterQuotaTest, UpdateQuotaRescindOffer)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start three agents and wait until their resources are available.
+  Future<Resources> agentTotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _))
+    .Times(3)
+    .WillOnce(InvokeAddSlave(&allocator))
+    .WillOnce(InvokeAddSlave(&allocator))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<3>(&agentTotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
+  ASSERT_SOME(slave1);
+
+  Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
+  ASSERT_SOME(slave2);
+
+  Try<Owned<cluster::Slave>> slave3 = StartSlave(detector.get());
+  ASSERT_SOME(slave3);
+
+  AWAIT_READY(agentTotalResources);
+
+  // Our quota request requires more resources than available on the agent
+  // (and in the cluster).
+  Resources agentResource =
+    agentTotalResources.get().filter([=](const Resource& resource) {
+      return (resource.name() == "cpus" || resource.name() == "mem");
+    });
+
+  // Set a quota request for ROLE1 in place for one agent.
+  {
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "quota",
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+        createRequestBody(ROLE1, agentResource));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // Start one framework on quota'ed ROLE1 and one in non-quota'ed ROLE2.
+  FrameworkInfo frameworkInfo1 = createFrameworkInfo(ROLE1);
+  MockScheduler sched1;
+  MesosSchedulerDriver framework1(
+      &sched1, frameworkInfo1, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered1;
+  EXPECT_CALL(sched1, registered(&framework1, _, _))
+    .WillOnce(FutureSatisfy(&registered1));
+
+  FrameworkInfo frameworkInfo2 = createFrameworkInfo(ROLE2);
+  MockScheduler sched2;
+  MesosSchedulerDriver framework2(
+      &sched2, frameworkInfo2, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<Nothing> registered2;
+  EXPECT_CALL(sched2, registered(&framework2, _, _))
+    .WillOnce(FutureSatisfy(&registered2));
+
+  // Setup offer expectation for all frameworks.
+  Future<vector<Offer>> offers1;
+  Future<vector<Offer>> offers2;
+  Future<vector<Offer>> offers3;
+  Future<vector<Offer>> offers4;
+
+  EXPECT_CALL(sched1, resourceOffers(&framework1, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillOnce(FutureArg<1>(&offers3))
+    .WillOnce(FutureArg<1>(&offers4));
+
+  EXPECT_CALL(sched2, resourceOffers(&framework2, _))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  framework1.start();
+  AWAIT_READY(registered1);
+  AWAIT_READY(offers1);
+
+  EXPECT_EQ(1u, offers1.get().size());
+
+  framework2.start();
+  AWAIT_READY(registered2);
+  AWAIT_READY(offers2);
+
+  EXPECT_EQ(2u, offers2.get().size());
+
+  std::set<OfferID> offerIds;
+  offerIds.insert(offers2.get()[0].id());
+  offerIds.insert(offers2.get()[1].id());
+
+  Future<OfferID> rescindedOffer1;
+  Future<OfferID> rescindedOffer2;
+  EXPECT_CALL(sched2, offerRescinded(&framework2, _))
+    .WillOnce(FutureArg<1>(&rescindedOffer1))
+    .WillOnce(FutureArg<1>(&rescindedOffer2));
+
+  const bool force = false;
+
+  // Increase the previously requested quota to two agents.
+  // Master should only rescind one offer.
+  {
+    Resources quotaResources = agentResource + agentResource;
+
+    Future<Response> response = process::http::request(
+        process::http::createRequest(
+            master.get()->pid,
+            "PUT",
+            false,
+            "quota",
+            createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+            createRequestBody(ROLE1, quotaResources, force)));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  AWAIT_READY(rescindedOffer1);
+  AWAIT_READY(offers3);
+  EXPECT_TRUE(rescindedOffer2.isPending());
+
+  EXPECT_TRUE(offerIds.count(rescindedOffer1.get()) > 0);
+  offerIds.erase(rescindedOffer1.get());
+  EXPECT_EQ(1, offerIds.size());
+
+  // Increase the previously requested quota to three agents.
+  // Master should rescind one more offer.
+  {
+    Resources quotaResources = agentResource + agentResource + agentResource;
+
+    Future<Response> response = process::http::request(
+        process::http::createRequest(
+            master.get()->pid,
+            "PUT",
+            false,
+            "quota",
+            createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+            createRequestBody(ROLE1, quotaResources, force)));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  AWAIT_READY(rescindedOffer2);
+  AWAIT_READY(offers4);
+
+  EXPECT_TRUE(offerIds.count(rescindedOffer2.get()) > 0);
+  offerIds.erase(rescindedOffer2.get());
+  EXPECT_EQ(0, offerIds.size());
+
+  // Decrease the previously requested quota to two agents.
+  // We don't actively rescind offer from over allocated quota'ed role now.
+  {
+    Resources quotaResources = agentResource + agentResource;
+
+    Future<Response> response = process::http::request(
+        process::http::createRequest(
+            master.get()->pid,
+            "PUT",
+            false,
+            "quota",
+            createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+            createRequestBody(ROLE1, quotaResources, force)));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+  }
+
+  // TODO(zhitao): Consider decline some or all offers from framework1 here,
+  // and verify that quota is still respected.
+
+  framework1.stop();
+  framework1.join();
+
+  framework2.stop();
+  framework2.join();
 }
 
 
