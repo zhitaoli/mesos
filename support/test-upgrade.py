@@ -68,10 +68,31 @@ class Master(Process):
         pass
 
 
-# Class representing a framework instance (the test-framework for now).
-#
-# TODO(greggomann): Add support for multiple frameworks.
+CPP_TEST_FRAMEWORK = 'cpp-test-framework'
+JAVA_TEST_FRAMEWORK = 'java-test-framework'
+PYTHON_TEST_FRAMEWORK = 'python-test-framework'
+ALL_FRAMEWORKS = [
+    CPP_TEST_FRAMEWORK,
+    JAVA_TEST_FRAMEWORK,
+    PYTHON_TEST_FRAMEWORK,
+]
+
+
+# Class representing a framework instance.
 class Framework(Process):
+
+    # Factory method to create actual framework by name.
+    @classmethod
+    def create(cls, name, path):
+        if name == CPP_TEST_FRAMEWORK:
+            return CppFramework(path)
+        elif name == JAVA_TEST_FRAMEWORK:
+            return JavaFramework(path)
+        elif name == PYTHON_TEST_FRAMEWORK:
+            return PythonFramework(path)
+        else:
+            print 'Unknown framework name: ' + name
+            sys.exit(1)
 
     def __init__(self, path):
         # The test-framework can take these parameters as environment variables,
@@ -92,9 +113,29 @@ class Framework(Process):
             'DEFAULT_SECRET': DEFAULT_SECRET
         }
 
-        Process.__init__(self, [os.path.join(path, 'src', 'test-framework'),
-                                '--master=127.0.0.1:5050'], environment)
-        pass
+        Process.__init__(self, self.args(path), environment)
+
+    def args(self, path):
+        raise NotImplementedError()
+
+
+class CppFramework(Framework):
+
+    def args(self, path):
+        return [os.path.join(path, 'src', 'test-framework'), '--master=127.0.0.1:5050']
+
+
+class JavaFramework(Framework):
+
+    def args(self, path):
+        return [os.path.join(path, 'src', 'examples', 'java', 'test-framework'), '127.0.0.1:5050']
+
+
+class PythonFramework(Framework):
+
+    def args(self, path):
+        return [os.path.join(path, 'src', 'examples', 'python', 'test-framework'), '127.0.0.1:5050']
+
 
 
 # Convenience function to get the Mesos version from the built executables.
@@ -110,35 +151,7 @@ def version(path):
 
     return output[:-1]
 
-
-# Script to test the upgrade path between two versions of Mesos.
-#
-# TODO(nnielsen): Add support for zookeeper and failover of master.
-# TODO(nnielsen): Add support for testing scheduler live upgrade/failover.
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Test upgrade path between two mesos builds')
-    parser.add_argument('--prev',
-                        type=str,
-                        help='Build path to mesos version to upgrade from',
-                        required=True)
-
-    parser.add_argument('--next',
-                        type=str,
-                        help='Build path to mesos version to upgrade to',
-                        required=True)
-    args = parser.parse_args()
-
-    prev_path = args.prev
-    next_path = args.next
-
-    # Get the version strings from the built executables.
-    prev_version = version(prev_path)
-    next_version = version(next_path)
-
-    if prev_version == False or next_version == False:
-        print 'Could not get mesos version numbers'
-        sys.exit(1)
-
+def run_framework(framework, prev_version, next_version):
     # Write credentials to temporary file.
     credfile = tempfile.mktemp()
     with open(credfile, 'w') as fout:
@@ -150,7 +163,8 @@ if __name__ == '__main__':
     # Create a work directory for the agent.
     agent_work_dir = tempfile.mkdtemp()
 
-    print 'Running upgrade test from %s to %s' % (prev_version, next_version)
+    print 'Running upgrade test from %s to %s for framework %s' % (
+        prev_version, next_version, framework)
 
     print """\
 +--------------+----------------+----------------+---------------+
@@ -186,7 +200,7 @@ NOTE: live denotes that master process keeps running from previous case.
 
     print '##### Starting %s framework #####' % prev_version
     print 'Waiting for %s framework to complete (10 sec max)...' % prev_version
-    prev_framework = Framework(prev_path)
+    prev_framework = Framework.create(framework, prev_path)
     if prev_framework.sleep(10) != 0:
         print '%s framework failed' % prev_version
         sys.exit(1)
@@ -217,7 +231,7 @@ NOTE: live denotes that master process keeps running from previous case.
 
     print '##### Starting %s framework #####' % prev_version
     print 'Waiting for %s framework to complete (10 sec max)...' % prev_version
-    prev_framework = Framework(prev_path)
+    prev_framework = Framework.create(framework, prev_path)
     if prev_framework.sleep(10) != 0:
         print '%s framework failed with %s master and %s agent' % (prev_version,
                                                                    next_version,
@@ -239,7 +253,7 @@ NOTE: live denotes that master process keeps running from previous case.
 
     print '##### Starting %s framework #####' % prev_version
     print 'Waiting for %s framework to complete (10 sec max)...' % prev_version
-    prev_framework = Framework(prev_path)
+    prev_framework = Framework.create(framework, prev_path)
     if prev_framework.sleep(10) != 0:
         print '%s framework failed with %s master and %s agent' % (prev_version,
                                                                    next_version,
@@ -252,7 +266,7 @@ NOTE: live denotes that master process keeps running from previous case.
 
     print '##### Starting %s framework #####' % next_version
     print 'Waiting for %s framework to complete (10 sec max)...' % next_version
-    next_framework = Framework(next_path)
+    next_framework = Framework.create(framework, next_path)
     if next_framework.sleep(10) != 0:
         print '%s framework failed with %s master and %s agent' % (next_version,
                                                                    next_version,
@@ -260,4 +274,54 @@ NOTE: live denotes that master process keeps running from previous case.
         sys.exit(1)
 
     # Test passed.
-    sys.exit(0)
+    print '%s framework succeeded with %s master and %s agent' % (next_version,
+                                                                  next_version,
+                                                                  next_version)
+
+
+# Script to test the upgrade path between two versions of Mesos.
+#
+# TODO(nnielsen): Add support for zookeeper and failover of master.
+# TODO(nnielsen): Add support for testing scheduler live upgrade/failover.
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Test upgrade path between two mesos builds')
+    parser.add_argument('--prev',
+                        type=str,
+                        help='Build path to mesos version to upgrade from',
+                        required=True)
+
+    parser.add_argument('--next',
+                        type=str,
+                        help='Build path to mesos version to upgrade to',
+                        required=True)
+
+    parser.add_argument('--exclude-framework',
+                        action='append',
+                        help='Exclude one of the supported test '
+                             'frameworks from [%s]' % 
+                             ', '.join(ALL_FRAMEWORKS))
+
+    args = parser.parse_args()
+
+    prev_path = args.prev
+    next_path = args.next
+    exclude_frameworks = args.exclude_framework \
+        if args.exclude_framework else []
+    frameworks = [name for name in ALL_FRAMEWORKS
+        if name not in exclude_frameworks]
+
+    # Get the version strings from the built executables.
+    prev_version = version(prev_path)
+    next_version = version(next_path)
+
+    if prev_version == False or next_version == False:
+        print 'Could not get mesos version numbers'
+        sys.exit(1)
+
+    if not frameworks:
+        print 'No framework to run'
+        sys.exit(1)
+
+    for framework in frameworks:
+        run_framework(framework, prev_version, next_version)
+
