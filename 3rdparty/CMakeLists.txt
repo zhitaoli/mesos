@@ -316,7 +316,6 @@ elseif (WIN32)
 endif (NOT WIN32)
 
 if (NOT WIN32)
-  PATCH_CMD(${MESOS_3RDPARTY_SRC}/protobuf-2.6.1.patch PROTOBUF_PATCH_CMD)
   set(PROTOBUF_CONFIG_CMD  ${PROTOBUF_ROOT}/src/../configure --prefix=${PROTOBUF_LIB_ROOT})
   set(PROTOBUF_BUILD_CMD   make)
   set(PROTOBUF_INSTALL_CMD make install)
