@@ -46,8 +46,9 @@
 #include "slave/slave.hpp"
 #include "slave/qos_controllers/load.hpp"
 
-#include "tests/flags.hpp"
+#include "tests/allocator.hpp"
 #include "tests/containerizer.hpp"
+#include "tests/flags.hpp"
 #include "tests/mesos.hpp"
 #include "tests/mock_slave.hpp"
 #include "tests/resources_utils.hpp"
@@ -340,6 +341,186 @@ TEST_F(OversubscriptionTest, ForwardUpdateSlaveMessage)
   ASSERT_EQ(
       1.0,
       metrics.values["master/cpus_revocable_total"]);
+}
+
+
+// This test verifies that over allocation handling due to decreased oversubscription
+// handling not cause trouble. See MESOS-7566.
+TEST_F(OversubscriptionTest, OverAllocationFromDecrease)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _, _));
+
+  MockAuthorizer authorizer;
+
+  // Return a pending future from authorizer for the launch operation.
+  Future<Nothing> authorize;
+  Promise<bool> promise;
+
+  EXPECT_CALL(authorizer, authorized(_))
+    .WillOnce(Return(true))
+    .WillOnce(Return(true))
+    .WillOnce(DoAll(FutureSatisfy(&authorize),
+                    Return(promise.future())));
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.allocation_interval = Minutes(1);
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator, &authorizer, masterFlags);
+  ASSERT_SOME(master);
+
+  Future<SlaveRegisteredMessage> slaveRegistered =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  // Start the slave with mock executor and test resource estimator.
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  MockResourceEstimator resourceEstimator;
+
+  EXPECT_CALL(resourceEstimator, initialize(_));
+
+  Queue<Resources> estimations;
+  EXPECT_CALL(resourceEstimator, oversubscribable())
+    .WillRepeatedly(InvokeWithoutArgs(&estimations, &Queue<Resources>::get));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.oversubscribed_resources_interval = Seconds(1);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _));
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, &resourceEstimator, flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegistered);
+
+  Future<UpdateSlaveMessage> update =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  Clock::pause();
+  // No update should be sent until there is an estimate.
+  Clock::advance(flags.oversubscribed_resources_interval);
+  Clock::settle();
+  Clock::resume();
+
+  ASSERT_FALSE(update.isReady());
+
+  Future<Option<Resources>> updateSlaveResources1;
+  Future<Option<Resources>> updateSlaveResources2;
+  EXPECT_CALL(allocator, updateSlave(_, _, _))
+    .WillOnce(DoAll(InvokeUpdateSlave(&allocator),
+                    FutureArg<1>(&updateSlaveResources1)))
+    .WillOnce(DoAll(InvokeUpdateSlave(&allocator),
+                    FutureArg<1>(&updateSlaveResources2)));
+
+  // Inject an estimation of oversubscribable resources of 10 cpus.
+  Resources resources = createRevocableResources("cpus", "10");
+  estimations.put(resources);
+
+  AWAIT_READY(update);
+
+  EXPECT_EQ(update->oversubscribed_resources(), resources);
+
+  AWAIT_READY(updateSlaveResources1);
+  EXPECT_SOME_EQ(resources, updateSlaveResources1.get());
+
+  // Start the framework which accepts revocable resources.
+  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+  framework.add_capabilities()->set_type(
+      FrameworkInfo::Capability::REVOCABLE_RESOURCES);
+  framework.set_role("role");
+
+  // Start a scheduler capable of receiving revocable resource.
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers1;
+  Future<vector<Offer>> offers2;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers1))
+    .WillOnce(FutureArg<1>(&offers2));
+
+  driver.start();
+
+  // TODO(bmahler): This lambda is copied in several places
+  // in the code, consider how best to pull this out.
+  auto unallocated = [](const Resources& resources) {
+    Resources result = resources;  
+    result.unallocate();
+    return result;
+  };  
+
+  // Initial offer should include both revocable and non revocable.
+  AWAIT_READY(offers1);
+  EXPECT_EQ(1u, offers1->size());
+  const Offer offer1 = offers1.get()[0];
+  EXPECT_EQ(resources, unallocated(Resources(offer1.resources()).revocable()));
+  EXPECT_FALSE(Resources(offer1.resources()).nonRevocable().empty());
+
+  // Now perform a dynamic reservation on regular resources.
+  Resources unreserved = Resources(offer1.resources()).nonRevocable();
+  Resources dynamicallyReserved = unreserved.flatten(
+      framework.role(),
+      createReservationInfo(framework.principal())).get();
+
+  // We use the filter explicitly here so that the resources will not
+  // be filtered for 5 seconds (the default).
+  Filters filters;
+  filters.set_refuse_seconds(0);
+
+  // EXPECT_CALL(allocator, updateAllocation(_, _, _, _));
+
+  // Reserve the resources.
+  driver.acceptOffers({offer1.id()}, {RESERVE(dynamicallyReserved)}, filters);
+
+  // Block until authorization happens.
+  AWAIT_READY(authorize);
+
+  // Generate another decreased resource estimation of 6 cpu cores.
+  Future<UpdateSlaveMessage> update2 =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resources = createRevocableResources("cpus", "8");
+
+  estimations.put(resources);
+
+  Clock::pause();
+  // Send another oversubscription estimation.
+  Clock::advance(flags.oversubscribed_resources_interval);
+  Clock::settle();
+  Clock::resume();
+
+  AWAIT_READY(update2);
+  EXPECT_EQ(update2->oversubscribed_resources(), resources);
+
+  AWAIT_READY(updateSlaveResources2);
+  EXPECT_SOME_EQ(resources, updateSlaveResources2.get());
+
+  LOG(INFO) << "Update without offer happened, now resuming authorization.";
+
+  // Now release the authorize operation.
+  promise.set(true);
+
+  Clock::pause();
+  // Advance allocation cycle to make sure another allocation happenes.
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::settle();
+  Clock::resume();
+
+  AWAIT_READY(offers2);
+  EXPECT_EQ(1u, offers2->size());
+  const Offer offer2 = offers2.get()[0];
+
+  EXPECT_EQ(resources, unallocated(Resources(offer2.resources()).revocable()));
+  EXPECT_EQ(dynamicallyReserved, Resources(offer2.resources()).nonRevocable());
+ 
+  driver.stop();
+  driver.join();
 }
 
 

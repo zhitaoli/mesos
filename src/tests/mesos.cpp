@@ -310,6 +310,19 @@ Try<Owned<cluster::Master>> MesosTest::StartMaster(
 
 
 Try<Owned<cluster::Master>> MesosTest::StartMaster(
+    mesos::allocator::Allocator* allocator,
+    Authorizer* authorizer,
+    const Option<master::Flags>& flags)
+{
+  return cluster::Master::start(
+      flags.isNone() ? CreateMasterFlags() : flags.get(),
+      zookeeperUrl,
+      allocator,
+      authorizer);
+}
+
+
+Try<Owned<cluster::Master>> MesosTest::StartMaster(
     const shared_ptr<MockRateLimiter>& slaveRemovalLimiter,
     const Option<master::Flags>& flags)
 {

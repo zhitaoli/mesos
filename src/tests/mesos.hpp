@@ -140,6 +140,12 @@ protected:
       Authorizer* authorizer,
       const Option<master::Flags>& flags = None());
 
+  // Starts a master with the specified allocator process, authorizer and flags.
+  virtual Try<process::Owned<cluster::Master>> StartMaster(
+      mesos::allocator::Allocator* allocator,
+      Authorizer* authorizer,
+      const Option<master::Flags>& flags = None());
+
   // Starts a master with a slave removal rate limiter and flags.
   // NOTE: The `slaveRemovalLimiter` is a `shared_ptr` because the
   // underlying `Master` process requires the pointer in this form.
