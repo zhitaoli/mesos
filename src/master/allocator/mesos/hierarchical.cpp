@@ -736,6 +736,8 @@ void HierarchicalAllocatorProcess::updateAllocation(
 
     // Update the total and allocated resources in the framework sorter
     // for the current role.
+    LOG(INFO) << "Removing from frameworkSorter " << frameworkAllocation;
+    LOG(INFO) << "Adding to frameworkSorter " << updatedFrameworkAllocation.get();
     frameworkSorter->remove(slaveId, frameworkAllocation);
     frameworkSorter->add(slaveId, updatedFrameworkAllocation.get());
 
