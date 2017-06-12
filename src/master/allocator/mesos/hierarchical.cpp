@@ -564,6 +564,9 @@ void HierarchicalAllocatorProcess::updateSlave(
     const Option<Resources>& oversubscribed,
     const Option<vector<SlaveInfo::Capability>>& capabilities)
 {
+
+  LOG(INFO) << "updateSlave being called here!";
+
   CHECK(initialized);
   CHECK(slaves.contains(slaveId));
 
@@ -627,6 +630,8 @@ void HierarchicalAllocatorProcess::updateSlave(
   if (updated) {
     allocate(slaveId);
   }
+
+  LOG(INFO) << "updateSlave returning";
 }
 
 
@@ -834,6 +839,8 @@ void HierarchicalAllocatorProcess::updateAllocation(
   CHECK_SOME(updatedTotal);
   updateSlaveTotal(slaveId, updatedTotal.get());
 
+  LOG(INFO) << "Removing from frameworkSorter " << offeredResources;
+  LOG(INFO) << "Adding to frameworkSorter " << updatedOfferedResources;
   // Update the total resources in the framework sorter.
   frameworkSorter->remove(slaveId, offeredResources);
   frameworkSorter->add(slaveId, updatedOfferedResources);

@@ -3002,6 +3002,7 @@ void Master::_subscribe(
       // replied to the offers but the driver might have dropped
       // those messages since it wasn't connected to the master.
       foreach (Offer* offer, utils::copy(framework->offers)) {
+        VLOG(1) << "Triggering recoverResources here: " << offer->resources();
         allocator->recoverResources(
             offer->framework_id(),
             offer->slave_id(),
@@ -3166,6 +3167,7 @@ void Master::deactivate(Framework* framework, bool rescind)
 
   // Remove the framework's offers.
   foreach (Offer* offer, utils::copy(framework->offers)) {
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(),
         offer->slave_id(),
@@ -3221,6 +3223,7 @@ void Master::deactivate(Slave* slave)
 
   // Remove and rescind offers.
   foreach (Offer* offer, utils::copy(slave->offers)) {
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(),
         slave->id,
@@ -3775,6 +3778,7 @@ void Master::accept(
         // Don't bother adding resources to `offeredResources` in case
         // validation failed; just recover them.
         if (error.isSome()) {
+          VLOG(1) << "Triggering recoverResources here: " << offer->resources();
           allocator->recoverResources(
               offer->framework_id(),
               offer->slave_id(),
@@ -4010,6 +4014,7 @@ void Master::_accept(
       << "Ignoring ACCEPT call for framework " << frameworkId
       << " because the framework cannot be found";
 
+    VLOG(1) << "Triggering recoverResources here: " << offeredResources;;
     // Tell the allocator about the recovered resources.
     allocator->recoverResources(
         frameworkId,
@@ -4082,6 +4087,7 @@ void Master::_accept(
       }
     }
 
+    VLOG(1) << "Triggering recoverResources here: " << offeredResources;;
     // Tell the allocator about the recovered resources.
     allocator->recoverResources(
         frameworkId,
@@ -4342,6 +4348,7 @@ void Master::_accept(
 
           foreach (const Resource& volume, operation.destroy().volumes()) {
             if (offered.contains(volume)) {
+              VLOG(1) << "Triggering recoverResources here: " << offered;;
               allocator->recoverResources(
                   offer->framework_id(),
                   offer->slave_id(),
@@ -4760,6 +4767,7 @@ void Master::_accept(
 
   if (!_offeredResources.empty()) {
     // Tell the allocator about the unused (e.g., refused) resources.
+    VLOG(1) << "Triggering recoverResources here: " << _offeredResources;
     allocator->recoverResources(
         frameworkId,
         slaveId,
@@ -4842,6 +4850,7 @@ void Master::decline(
   foreach (const OfferID& offerId, decline.offer_ids()) {
     Offer* offer = getOffer(offerId);
     if (offer != nullptr) {
+      VLOG(1) << "Triggering recoverResources here: " << offer->resources();
       allocator->recoverResources(
           offer->framework_id(),
           offer->slave_id(),
@@ -6294,6 +6303,7 @@ void Master::updateFramework(
       continue;
     }
 
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(),
         offer->slave_id(),
@@ -6344,10 +6354,11 @@ void Master::updateSlave(
 
   slave->totalResources =
     slave->totalResources.nonRevocable() + oversubscribedResources.revocable();
-
+  LOG(INFO) << "Before calling allocator->updateSlave";
   // First update the agent's resources in the allocator.
   allocator->updateSlave(slaveId, oversubscribedResources);
 
+  LOG(INFO) << "After calling allocator->updateSlave";
   // Then rescind any outstanding offers with revocable resources.
   // NOTE: Need a copy of offers because the offers are removed inside the loop.
   foreach (Offer* offer, utils::copy(slave->offers)) {
@@ -6357,6 +6368,7 @@ void Master::updateSlave(
                 << " with revocable resources " << offered
                 << " on agent " << *slave;
 
+      VLOG(1) << "Triggering recoverResources here: " << offered;
       allocator->recoverResources(
           offer->framework_id(), offer->slave_id(), offered, None());
 
@@ -6405,6 +6417,7 @@ void Master::updateUnavailability(
       // Remove and rescind offers since we want to inform frameworks of the
       // unavailability change as soon as possible.
       foreach (Offer* offer, utils::copy(slave->offers)) {
+        VLOG(1) << "Triggering recoverResources here: " << offer->resources();
         allocator->recoverResources(
             offer->framework_id(), slave->id, offer->resources(), None());
 
@@ -6837,6 +6850,7 @@ void Master::_markUnreachable(
   foreach (Offer* offer, utils::copy(slave->offers)) {
     // TODO(vinod): We don't need to call 'Allocator::recoverResources'
     // once MESOS-621 is fixed.
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(), slave->id, offer->resources(), None());
 
@@ -7177,6 +7191,7 @@ void Master::offer(
       foreachpair (const SlaveID& slaveId,
                    const Resources& offered,
                    resources.at(role)) {
+        VLOG(1) << "Triggering recoverResources here: " << offered;
         allocator->recoverResources(frameworkId, slaveId, offered, None());
       }
     }
@@ -7200,6 +7215,7 @@ void Master::offer(
           << "Master returning resources offered to framework " << *framework
           << " because agent " << slaveId << " is not valid";
 
+        VLOG(1) << "Triggering recoverResources here: " << offered;
         allocator->recoverResources(frameworkId, slaveId, offered, None());
         continue;
       }
@@ -7211,6 +7227,7 @@ void Master::offer(
           << "Master returning resources offered because agent " << *slave
           << " is " << (slave->connected ? "deactivated" : "disconnected");
 
+        VLOG(1) << "Triggering recoverResources here: " << offered;
         allocator->recoverResources(frameworkId, slaveId, offered, None());
         continue;
       }
@@ -7233,6 +7250,7 @@ void Master::offer(
                        << "executors";
           // Pass a default filter to avoid getting this same offer immediately
           // from the allocator.
+          VLOG(1) << "Triggering recoverResources here: " << offered;
           allocator->recoverResources(frameworkId, slaveId, offered, Filters());
           continue;
         }
@@ -7955,6 +7973,7 @@ void Master::_failoverFramework(Framework* framework)
 {
   // Remove the framework's offers (if they weren't removed before).
   foreach (Offer* offer, utils::copy(framework->offers)) {
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();;
     allocator->recoverResources(
         offer->framework_id(), offer->slave_id(), offer->resources(), None());
 
@@ -8461,6 +8480,7 @@ void Master::_removeSlave(
   foreach (Offer* offer, utils::copy(slave->offers)) {
     // TODO(vinod): We don't need to call 'Allocator::recoverResources'
     // once MESOS-621 is fixed.
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(), slave->id, offer->resources(), None());
 
@@ -8584,6 +8604,7 @@ void Master::updateTask(Task* task, const StatusUpdate& update)
 
   // Once the task becomes removable, recover the resources.
   if (removable) {
+    VLOG(1) << "Triggering recoverResources here: " << task->resources();
     allocator->recoverResources(
         task->framework_id(),
         task->slave_id(),
@@ -8665,6 +8686,7 @@ void Master::removeTask(Task* task)
 
     // If the task is not removable, then the resources have
     // not yet been recovered.
+    VLOG(1) << "Triggering recoverResources here: " << task->resources();
     allocator->recoverResources(
         task->framework_id(),
         task->slave_id(),
@@ -8704,6 +8726,7 @@ void Master::removeExecutor(
             << "' with resources " << executor.resources()
             << " of framework " << frameworkId << " on agent " << *slave;
 
+  VLOG(1) << "Triggering recoverResources here: " << executor.resources();
   allocator->recoverResources(
       frameworkId, slave->id, executor.resources(), None());
 
@@ -8745,6 +8768,7 @@ void Master::offerTimeout(const OfferID& offerId)
 {
   Offer* offer = getOffer(offerId);
   if (offer != nullptr) {
+    VLOG(1) << "Triggering recoverResources here: " << offer->resources();
     allocator->recoverResources(
         offer->framework_id(), offer->slave_id(), offer->resources(), None());
     removeOffer(offer, true);
