@@ -905,6 +905,9 @@ public:
                          const Image&));
 
   MOCK_CONST_METHOD1(destroy, Future<bool>(const ContainerID&));
+
+  MOCK_CONST_METHOD1(pruneImages,
+                     Future<Nothing>(const vector<Image>& excludedImages));
 };
 
 
@@ -1169,6 +1172,93 @@ TEST_F(MesosContainerizerProvisionerTest, IsolatorCleanupBeforePrepare)
 
   EXPECT_FALSE(termination.has_status());
 }
+
+
+// This test verifies that pruneImages passes down image references
+// for active containers.
+TEST_F(MesosContainerizerProvisionerTest, PruneImages)
+{
+  slave::Flags flags = CreateSlaveFlags();
+  flags.launcher = "posix";
+
+  Try<Launcher*> launcher_ = SubprocessLauncher::create(flags);
+  ASSERT_SOME(launcher_);
+
+  Owned<Launcher> launcher(new TestLauncher(Owned<Launcher>(launcher_.get())));
+
+  MockProvisioner* provisioner = new MockProvisioner();
+
+  Future<Nothing> provision;
+
+  EXPECT_CALL(*provisioner, provision(_, _))
+    .WillOnce(DoAll(FutureSatisfy(&provision),
+                    Return(ProvisionInfo{"rootfs", None()})));
+
+  Future<vector<Image>> excludedImages;
+
+  EXPECT_CALL(*provisioner, pruneImages(_))
+    .WillOnce(DoAll(FutureArg<0>(&excludedImages),
+                    Return(Nothing())));
+
+  EXPECT_CALL(*provisioner, destroy(_))
+    .WillOnce(Return(true));
+
+  Fetcher fetcher(flags);
+
+  Try<MesosContainerizer*> _containerizer = MesosContainerizer::create(
+      flags,
+      true,
+      &fetcher,
+      launcher,
+      Shared<Provisioner>(provisioner),
+      vector<Owned<Isolator>>());
+
+  Owned<MesosContainerizer> containerizer(_containerizer.get());
+
+  ContainerID containerId;
+  containerId.set_value(UUID::random().toString());
+
+  const string imageName = "fake-image1";
+
+  ContainerInfo containerInfo = createContainerInfo(imageName);
+
+  SlaveID slaveId = SlaveID();
+  slaveId.set_value("slave_id");
+
+  TaskInfo taskInfo = createTask(slaveId, Resources(), CommandInfo());
+  taskInfo.mutable_container()->CopyFrom(containerInfo);
+
+  ExecutorInfo executorInfo = createExecutorInfo("executor", "sleep 1000");
+  executorInfo.mutable_container()->CopyFrom(containerInfo);
+
+  Future<Containerizer::LaunchResult> launch = containerizer->launch(
+      containerId,
+      createContainerConfig(taskInfo, executorInfo, sandbox.get()),
+      map<string, string>(),
+      None());
+
+  AWAIT_ASSERT_EQ(Containerizer::LaunchResult::SUCCESS, launch);
+
+  Future<Nothing> pruneImages = containerizer->pruneImages();
+
+  AWAIT_READY(excludedImages);
+  EXPECT_EQ(1, excludedImages->size());
+  EXPECT_EQ(imageName, excludedImages->at(0).docker().name());
+
+  Future<bool> destroy = containerizer->destroy(containerId);
+  AWAIT_EXPECT_TRUE(destroy);
+}
+
+
+// TODO(zhitao): Add following test cases for `PruneImages`:
+// - Container which has no checkpointed `ContainerConfig` prevents
+//   `PruneImages` to proceed;
+// - Container whose rootfs is being provisioned will still see its
+//   image reference passed down to `PruneImages`;
+// - Container which has terminated will not see its image being
+//   passed down in `excludedImages` in `PruneImages;
+// - After a containerizer recovery, image reference of recovered
+//   container will still be passed down in `excludedImages`.
 
 
 // This action destroys the container using the real launcher and

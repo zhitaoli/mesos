@@ -33,6 +33,7 @@
 #include "linux/fs.hpp"
 #endif // __linux__
 
+#include "slave/containerizer/mesos/provisioner/backend.hpp"
 #include "slave/containerizer/mesos/provisioner/constants.hpp"
 #include "slave/containerizer/mesos/provisioner/paths.hpp"
 
@@ -369,6 +370,64 @@ TEST_F(ProvisionerDockerLocalStoreTest, PullingSameImageSimutanuously)
   EXPECT_EQ(imageInfo1->layers, imageInfo2->layers);
 }
 
+
+// This tests pruning images for docker store, especially that
+// active images and layers will not be pruned.
+TEST_F(ProvisionerDockerLocalStoreTest, PruneImages)
+{
+  slave::Flags flags;
+  flags.docker_registry = path::join(os::getcwd(), "images");
+  flags.docker_store_dir = path::join(os::getcwd(), "store");
+  flags.image_provisioner_backend = COPY_BACKEND;
+
+  Try<Owned<slave::Store>> store = Store::create(flags);
+  ASSERT_SOME(store);
+
+  const string imageName = "abc";
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name(imageName);
+
+  Future<slave::ImageInfo> imageInfo = store.get()->get(
+      image, flags.image_provisioner_backend.get());
+
+  AWAIT_READY(imageInfo);
+  verifyLocalDockerImage(flags, imageInfo->layers);
+
+  vector<Image> excludedImages{image};
+
+  // PruneImages with same excludedImages call should
+  // keep the layers around.
+  Future<Nothing> prune = store.get()->prune(excludedImages, {});
+  AWAIT_READY(prune);
+
+  // The layers should still be there for verify.
+  verifyLocalDockerImage(flags, imageInfo->layers);
+
+  const string layerPath1 =
+    paths::getImageLayerRootfsPath(flags.docker_store_dir, "123", COPY_BACKEND);
+
+  const string layerPath2 =
+    paths::getImageLayerRootfsPath(flags.docker_store_dir, "456", COPY_BACKEND);
+
+  // Keep all layers around through `activeLayerPaths`.
+  Future<Nothing> prune2 = store.get()->prune({}, {layerPath1, layerPath2});
+  AWAIT_READY(prune2);
+  verifyLocalDockerImage(flags, imageInfo->layers);
+
+  // Do not keep any image or layer, this should result
+  // in an empty layers directory.
+  Future<Nothing> prune3 = store.get()->prune({}, {});
+  AWAIT_READY(prune3);
+
+  EXPECT_FALSE(os::exists(layerPath1));
+
+  // We can still get the image, but it need to pull again.
+  Future<slave::ImageInfo> imageInfo3 = store.get()->get(
+      image, flags.image_provisioner_backend.get());
+  AWAIT_READY(imageInfo3);
+}
 
 #ifdef __linux__
 class ProvisionerDockerTest
@@ -1090,6 +1149,189 @@ TEST_F(ProvisionerDockerTest, ROOT_RecoverNestedOnReboot)
 }
 
 #endif // __linux__
+
+// This test verifies that provisioner checkpoints layers from provision
+// call, recovers them after agent recovery, and able to pass the layers
+// to image stores.
+TEST_F(ProvisionerDockerTest, RecoverLayersForPrune)
+{
+  const string directory = path::join(os::getcwd(), "archives");
+
+  Future<Nothing> testImage = DockerArchive::create(directory, "alpine");
+  AWAIT_READY(testImage);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.image_provisioner_backend = COPY_BACKEND;
+  flags.docker_registry = directory;
+  flags.docker_store_dir = path::join(os::getcwd(), "store");
+
+  Try<Owned<Provisioner>> provisioner = Provisioner::create(flags);
+  ASSERT_SOME(provisioner);
+
+  ContainerID containerId;
+  containerId.set_value(UUID::random().toString());
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  AWAIT_READY(provisioner.get()->provision(containerId, image));
+
+  const string layersPath = slave::provisioner::paths::getLayersFilePath(
+      slave::paths::getProvisionerDir(flags.work_dir),
+      containerId);
+
+  EXPECT_TRUE(os::exists(layersPath));
+
+  // Reset provisioner.
+  provisioner = Provisioner::create(flags);
+  ASSERT_SOME(provisioner);
+
+  AWAIT_READY(provisioner.get()->recover({containerId}));
+
+  // The prune call should not prune any layer.
+  Future<Nothing> prune = provisioner.get()->pruneImages({});
+
+  AWAIT_READY(prune);
+
+  // Verify that layers in docker store are not empty.
+  Try<std::list<string>> layers =
+    slave::docker::paths::listLayers(flags.docker_store_dir);
+  ASSERT_SOME(layers);
+  ASSERT_NE(layers->size(), 0);
+}
+
+// TODO(zhitao): Add a test to check that when layer information
+// for a container is not properly recovered, `pruneImages` call is
+// failed.
+
+class MockStore: public slave::Store
+{
+public:
+  MockStore() {}
+
+  virtual ~MockStore() {}
+
+  MOCK_METHOD0(
+      recover,
+      Future<Nothing>());
+
+  MOCK_METHOD2(
+      get,
+      Future<ImageInfo>(
+          const Image&,
+          const string&));
+
+  MOCK_METHOD2(
+      prune,
+      Future<Nothing>(
+          const vector<Image>&,
+          const hashset<string>&));
+};
+
+
+// This test verifies that pruneImages call are blocked until active
+// provision finishes, but multiple provision requests can happen
+// at the same time, because of the RWMutex used to protect provisoiner.
+TEST_F(ProvisionerDockerTest, PruneBlocksOnProvision)
+{
+  const string directory = path::join(os::getcwd(), "archives");
+
+  Future<Nothing> testImage = DockerArchive::create(directory, "alpine");
+  AWAIT_READY(testImage);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.isolation = "docker/runtime,filesystem/linux";
+  flags.image_providers = "docker";
+  flags.image_provisioner_backend = COPY_BACKEND;
+  flags.docker_registry = directory;
+  flags.docker_store_dir = path::join(os::getcwd(), "store");
+
+  hashmap<string, Owned<slave::Backend>> backends =
+    slave::Backend::create(flags);
+
+  Try<Owned<slave::Store>> store = slave::docker::Store::create(flags);
+  ASSERT_SOME(store);
+
+  MockStore* mockStore = new MockStore();
+
+  hashmap<Image::Type, process::Owned<slave::Store>> stores{
+    {Image::DOCKER, Owned<slave::Store>(mockStore)}
+  };
+
+  const string rootDir = slave::paths::getProvisionerDir(flags.work_dir);
+
+  Owned<slave::ProvisionerProcess> process(
+      new slave::ProvisionerProcess(
+          rootDir,
+          COPY_BACKEND,
+          stores,
+          backends));
+
+  Owned<Provisioner> provisioner(new Provisioner(process));
+
+  ContainerID containerId1;
+  containerId1.set_value("container1");
+
+  ContainerID containerId2;
+  containerId2.set_value("container2");
+
+  ContainerID containerId3;
+  containerId3.set_value("container3");
+
+  Image image;
+  image.set_type(Image::DOCKER);
+  image.mutable_docker()->set_name("alpine");
+
+  Future<ImageInfo> imageInfo = store.get()->get(image, COPY_BACKEND);
+  AWAIT_READY(imageInfo);
+
+  Promise<ImageInfo> getPromise;
+  Promise<Nothing> prunePromise;
+
+  // Block the first provision while allow the second to finish.
+  EXPECT_CALL(*mockStore, get(_, _))
+    .WillOnce(Return(getPromise.future()))
+    .WillOnce(Return(imageInfo))
+    .WillOnce(Return(imageInfo));
+
+  EXPECT_CALL(*mockStore, prune(_, _))
+    .WillOnce(Return(prunePromise.future()));
+
+  Future<slave::ProvisionInfo> provision1 =
+    provisioner->provision(containerId1, image);
+
+  Future<slave::ProvisionInfo> provision2 =
+    provisioner->provision(containerId2, image);
+
+  Future<Nothing> prune =
+    provisioner->pruneImages({image});
+
+  Future<slave::ProvisionInfo> provision3 =
+    provisioner->provision(containerId3, image);
+
+  AWAIT_READY(provision2);
+
+  ASSERT_FALSE(provision1.isReady());
+  ASSERT_FALSE(prune.isReady());
+  ASSERT_FALSE(provision3.isReady());
+
+  getPromise.set(imageInfo.get());
+
+  AWAIT_READY(provision1);
+
+  ASSERT_FALSE(prune.isReady());
+  ASSERT_FALSE(provision3.isReady());
+
+  prunePromise.set(Nothing());
+
+  AWAIT_READY(prune);
+  AWAIT_READY(provision3);
+}
+
+#endif
 
 } // namespace tests {
 } // namespace internal {
