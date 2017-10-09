@@ -4316,6 +4316,51 @@ TEST_P(AgentAPITest, GetContainers)
 }
 
 
+TEST_P(AgentAPITest, PruneImages)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  StandaloneMasterDetector detector(master.get()->pid);
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, &containerizer);
+  ASSERT_SOME(slave);
+
+  // Make sure agent is connected before issuing calls.
+  Future<SlaveRegisteredMessage> agentRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), master.get()->pid, _);
+
+  AWAIT_READY(agentRegisteredMessage);
+
+  EXPECT_CALL(containerizer, pruneImages())
+    .WillOnce(Return(Nothing()));
+
+  v1::agent::Call v1Call;
+  v1Call.set_type(v1::agent::Call::PRUNE_IMAGES);
+
+  ContentType contentType = GetParam();
+  http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+  headers["Accept"] = stringify(contentType);
+
+  Future<Nothing> v1Response = http::post(
+      slave.get()->pid,
+      "api/v1",
+      headers,
+      serialize(contentType, v1Call),
+      stringify(contentType))
+    .then([](const http::Response& response) -> Future<Nothing> {
+      if (response.status != http::OK().status) {
+        return Failure("Unexpected response status " + response.status);
+      }
+      return Nothing();
+    });
+
+  AWAIT_READY(v1Response);
+}
+
+
 // This test verifies if we can retrieve file data in the agent.
 TEST_P(AgentAPITest, ReadFile)
 {
