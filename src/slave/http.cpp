@@ -2447,7 +2447,8 @@ Future<Response> Http::pruneImages(
   // TODO(zhitao): Add AuthN/AuthZ.
 
   LOG(INFO) << "Processing PRUNE_IMAGES call";
-  vector<Image> excludedImages;
+  vector<Image> excludedImages(call.prune_images().excluded_images().begin(),
+                               call.prune_images().excluded_images().end());
 
   return slave->containerizer->pruneImages(excludedImages)
       .then([acceptType](const Future<Nothing>& result)
