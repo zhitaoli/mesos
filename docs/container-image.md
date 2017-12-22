@@ -390,6 +390,43 @@ and mount it under the sandbox directory. The executor can perform
 `pivot_root` or `chroot` itself to enter the container root
 filesystem.
 
+## Garbage Collect Unused Container Images
+
+Experimental support of garbage-collecting unused container images was added at
+Mesos 1.5. This can be either configured automatically with new agent flag
+`--image_gc_config`, or manually invoked through agent's
+[v1 Operator HTTP API](operator-http-api.md). This can be used to avoid
+unbounded disk space usage of image stores.
+
+This is implemented with a simple mark-and-sweep logic. When image gc happens,
+we check all layers and images referenced by active running containers and avoid
+removing them from the image store. As a prerequisite, if there are active
+containers launched before Mesos 1.5, we cannot determine what images can be
+safely garbage collected, so agent will refuse to invoke image gc.
+
+**NOTE**: this image gc is only supported for docker store currently.
+
+### Automatic Image GC Through Agent Flag
+
+To enable automatic image gc through agent flag, use the new `--image_gc_config`
+flag:
+
+    --image_gc_config=file:///home/vagrant/image-gc-config.json
+
+or as a JSON object,
+
+    --image_gc_config="{ \
+      \"image_disk_headroom\": 0.1, \
+      \"image_disk_watch_interval\": { \
+        \"nano_seconds\": 3600 \
+        }, \
+      \"excluded_images\": \[ \] \
+    }"
+
+
+### Manual Image GC through HTTP API
+See `PRUNE_IMAGES` section in  [v1 Operator HTTP API](operator-http-api.md) for
+how to manually trigger image gc through agent HTTP API.
 
 ## References
 
