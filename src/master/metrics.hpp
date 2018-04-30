@@ -196,6 +196,9 @@ struct Metrics
   process::metrics::Counter slave_unreachable_completed;
   process::metrics::Counter slave_unreachable_canceled;
 
+  // Subscriber metrics.
+  process::metrics::Gauge subscribers_active;
+
   // Non-revocable resources.
   std::vector<process::metrics::Gauge> resources_total;
   std::vector<process::metrics::Gauge> resources_used;

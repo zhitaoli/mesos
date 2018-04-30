@@ -11390,6 +11390,12 @@ double Master::_tasks_killing()
 }
 
 
+double Master::_subscribers_active()
+{
+  return subscribers.subscribed.size();
+}
+
+
 double Master::_resources_total(const string& name)
 {
   double total = 0.0;

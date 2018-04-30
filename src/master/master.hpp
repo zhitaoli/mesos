@@ -2143,6 +2143,8 @@ private:
   double _tasks_unreachable();
   double _tasks_killing();
 
+  double _subscribers_active();
+
   double _resources_total(const std::string& name);
   double _resources_used(const std::string& name);
   double _resources_percent(const std::string& name);

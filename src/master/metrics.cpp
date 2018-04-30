@@ -207,7 +207,10 @@ Metrics::Metrics(const Master& master)
     slave_unreachable_completed(
         "master/slave_unreachable_completed"),
     slave_unreachable_canceled(
-        "master/slave_unreachable_canceled")
+        "master/slave_unreachable_canceled"),
+    subscribers_active(
+        "master/subscribers_active",
+        defer(master, &Master::_subscribers_active))
 {
   // TODO(dhamon): Check return values of 'add'.
   process::metrics::add(uptime_secs);
@@ -306,6 +309,8 @@ Metrics::Metrics(const Master& master)
   process::metrics::add(slave_unreachable_scheduled);
   process::metrics::add(slave_unreachable_completed);
   process::metrics::add(slave_unreachable_canceled);
+
+  process::metrics::add(subscribers_active);
 
   // Create resource gauges.
   // TODO(dhamon): Set these up dynamically when adding a slave based on the
@@ -457,6 +462,8 @@ Metrics::~Metrics()
   process::metrics::remove(slave_unreachable_scheduled);
   process::metrics::remove(slave_unreachable_completed);
   process::metrics::remove(slave_unreachable_canceled);
+
+  process::metrics::remove(subscribers_active);
 
   foreach (const Gauge& gauge, resources_total) {
     process::metrics::remove(gauge);
