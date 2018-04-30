@@ -840,6 +840,24 @@ messages may indicate that there is a problem with the network.
 </tr>
 </table>
 
+#### HTTP API
+
+The following metrics provide information about HTTP API endpoints of Master.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>master/subscribers_active</code>
+  </td>
+  <td>Number of active subscribers to event stream API</td>
+  <td>Gauge</td>
+</tr>
+</table>
+
+
 #### Event queue
 
 The following metrics provide information about different types of events in the
