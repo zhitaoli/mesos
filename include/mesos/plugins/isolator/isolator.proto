@@ -1,0 +1,131 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package mesos.plugins.isolator;
+
+import "mesos/mesos.proto";
+
+import "mesos/slave/containerizer.proto";
+
+
+message InitializeRequest {}
+
+
+message InitializeResponse {
+    bool support_nested = 1;
+}
+
+
+message RecoverRequest {
+    repeated slave.ContainerState container_states = 1;
+    repeated ContainerID orphans = 2;
+}
+
+
+message RecoverResponse {}
+
+
+message PrepareRequest {
+    ContainerID container_id = 1; // REQUIRED
+    slave.ContainerConfig container_config = 2; // REQUIRED
+}
+
+
+message PrepareResponse {
+    slave.ContainerLaunchInfo launch_info = 1; // OPTIONAL
+}
+
+
+message IsolateRequest {
+    ContainerID container_id = 1; // REQUIRED
+    uint64 pid = 2; // REQUIRED
+}
+
+
+message IsolateResponse {
+}
+
+
+message WatchRequest {
+    ContainerID container_id = 1; // REQUIRED
+}
+
+
+message WatchResponse {
+    slave.ContainerLimitation termination = 1; // OPTIONAL
+}
+
+
+message UpdateRequest {
+    ContainerID container_id = 1; // REQUIRED
+    repeated Resource resources = 2; // REQUIRED
+}
+
+
+message UpdateResponse {
+}
+
+
+message UsageRequest {
+    ContainerID container_id = 1; // REQUIRED
+}
+
+
+message UsageResponse {
+    ResourceStatistics statistics = 1;
+}
+
+
+message StatusRequest {
+    ContainerID container_id = 1; // REQUIRED
+}
+
+
+message StatusResponse {
+    ContainerStatus status = 1; // REQUIRED
+}
+
+
+message CleanupRequest {
+    ContainerID container_id = 1; // REQUIRED
+}
+
+
+message CleanupResponse {
+}
+
+
+service IsolatorPlugin {
+  rpc Initialize(InitializeRequest) returns (InitializeResponse) {}
+
+  rpc Recover(RecoverRequest) returns (RecoverResponse) {}
+
+  rpc Prepare(PrepareRequest) returns (PrepareResponse) {}
+
+  rpc Isolate(IsolateRequest) returns (IsolateResponse) {}
+
+  rpc Update(UpdateRequest) returns (UpdateResponse) {}
+
+  rpc Watch(WatchRequest) returns (WatchResponse) {}
+
+  rpc Usage(UsageRequest) returns (UsageResponse) {}
+
+  rpc Status(StatusRequest) returns (StatusResponse) {}
+
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse) {}
+}

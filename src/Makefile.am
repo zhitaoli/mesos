@@ -380,6 +380,16 @@ CXX_PROTOS =								\
   ../include/mesos/v1/scheduler/scheduler.pb.h
 
 CXX_PROTOS +=								\
+  ../include/mesos/plugins/secret_resolver/secret_resolver.pb.cc	\
+  ../include/mesos/plugins/secret_resolver/secret_resolver.pb.h		\
+  ../include/mesos/plugins/secret_resolver/secret_resolver.grpc.pb.cc	\
+  ../include/mesos/plugins/secret_resolver/secret_resolver.grpc.pb.h	\
+  ../include/mesos/plugins/isolator/isolator.pb.cc					\
+  ../include/mesos/plugins/isolator/isolator.pb.h					\
+  ../include/mesos/plugins/isolator/isolator.grpc.pb.cc				\
+  ../include/mesos/plugins/isolator/isolator.grpc.pb.h
+
+CXX_PROTOS +=								\
   master/registry.pb.cc							\
   master/registry.pb.h							\
   messages/flags.pb.cc							\
@@ -484,6 +494,10 @@ CLEANFILES +=								\
 
 ../include/csi/%.grpc.pb.cc ../include/csi/%.grpc.pb.h: ../$(CSI)/%.proto
 	$(PROTOC) $(PROTOCFLAGS) --grpc_out=../include/csi $^		\
+	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN)
+
+../include/mesos/plugins/%.grpc.pb.cc ../include/mesos/plugins/%.grpc.pb.h:  $(top_srcdir)/include/mesos/plugins/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --grpc_out=../include $^		\
 	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN)
 
 # Targets for generating Java protocol buffer code.
