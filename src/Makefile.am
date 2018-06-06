@@ -2717,6 +2717,7 @@ mesos_tests_SOURCES +=						\
 if ENABLE_GRPC
 mesos_tests_SOURCES +=						\
   tests/agent_resource_provider_config_api_tests.cpp		\
+  tests/plugin_tests.cpp									\
   tests/storage_local_resource_provider_tests.cpp
 endif
 endif
