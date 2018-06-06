@@ -1455,4 +1455,10 @@ mesos::internal::slave::Flags::Flags()
         }
         return None();
       });
+
+  add(
+    &Flags::external_isolator_sockets,
+    "external_isolator_sockets",
+    "Comma separated domain socket addresses for external isolators.\n"
+    "Only supports one now");
 }

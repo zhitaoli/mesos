@@ -215,6 +215,8 @@ public:
   // two options `ip6` or `ip6_discovery_command` can be set at any
   // given point of time.
   Option<std::string> ip6_discovery_command;
+
+  Option<std::string> external_isolator_sockets;
 };
 
 } // namespace slave {

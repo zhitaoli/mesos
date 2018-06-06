@@ -1514,7 +1514,9 @@ libmesos_no_3rdparty_la_SOURCES +=					\
 if ENABLE_GRPC
 libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/storage/provider.cpp				\
-  resource_provider/storage/provider.hpp
+  resource_provider/storage/provider.hpp				\
+  slave/containerizer/mesos/isolators/plugins/external_isolator.cpp \
+  slave/containerizer/mesos/isolators/plugins/external_isolator.hpp
 endif
 
 libmesos_no_3rdparty_la_CPPFLAGS = $(MESOS_CPPFLAGS)

@@ -73,6 +73,7 @@
 
 #include "slave/containerizer/mesos/isolators/environment_secret.hpp"
 #include "slave/containerizer/mesos/isolators/filesystem/posix.hpp"
+#include "slave/containerizer/mesos/isolators/plugins/external_isolator.hpp"
 #include "slave/containerizer/mesos/isolators/posix.hpp"
 #include "slave/containerizer/mesos/isolators/posix/disk.hpp"
 #include "slave/containerizer/mesos/isolators/posix/rlimits.hpp"
@@ -428,6 +429,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
 #ifndef __WINDOWS__
     {"disk/du", &PosixDiskIsolatorProcess::create},
 #endif // !__WINDOWS__
+
+    {"plugins/external", &ExternalPluginIsolatorProcess::create},
 
 #if ENABLE_XFS_DISK_ISOLATOR
     {"disk/xfs", &XfsDiskIsolatorProcess::create},
